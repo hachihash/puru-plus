@@ -1,0 +1,2412 @@
+"use client";
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
+import confettiBurst from "canvas-confetti";
+
+type Player = 1 | 2;
+type Winner = Player | null;
+type GameMode = "cpu" | "local" | "online";
+type CpuDifficulty = "easy" | "normal" | "hard" | "god";
+type TargetValue = number;
+type FirstTurn = "p1" | "p2" | "random";
+type Screen = "menu" | "matching" | "play";
+
+type OnlineRole = "host" | "guest";
+type OnlineState = {
+  enabled: boolean;
+  roomId: string;
+  role: OnlineRole;
+  player: Player;
+  clientId: string;
+  ready: boolean;
+};
+
+type PublicMatchRow = {
+  id: number;
+  room_id: string;
+  status: "waiting" | "playing";
+};
+
+type OnlineBroadcastState = {
+  clientId: string;
+  target: number;
+  board: number[];
+  nextNumber: number;
+  nextQueue: number[];
+  nextIndex: number;
+  currentPlayer: Player;
+  movesLeft: number;
+  winner: Winner;
+  startingPlayer: Player;
+  actionDeadlineMs?: number | null;
+};
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+}
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+const BOARD_SIZE = 2;
+const TILE_COUNT = BOARD_SIZE * BOARD_SIZE;
+const DEFAULT_TARGET: TargetValue = 25;
+const TURN_ACTIONS = 3;
+
+function randInt(min: number, max: number) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function makeInitialBoard(): number[] {
+  return Array.from({ length: TILE_COUNT }, () => randInt(1, 9));
+}
+
+function isAdjacent(a: number, b: number) {
+  const ar = Math.floor(a / BOARD_SIZE);
+  const ac = a % BOARD_SIZE;
+  const br = Math.floor(b / BOARD_SIZE);
+  const bc = b % BOARD_SIZE;
+  return (ar === br && Math.abs(ac - bc) === 1) || (ac === bc && Math.abs(ar - br) === 1);
+}
+
+function computeToValue(sum: number, target: number) {
+  return sum === target ? target : sum > target ? sum % target : sum;
+}
+
+function listAllMovesForTarget(b: number[]): Array<{ from: number; to: number; sum: number }> {
+  const moves: Array<{ from: number; to: number; sum: number }> = [];
+  for (let from = 0; from < TILE_COUNT; from++) {
+    for (let to = 0; to < TILE_COUNT; to++) {
+      if (from === to) continue;
+      if (!isAdjacent(from, to)) continue;
+      moves.push({ from, to, sum: b[to] + b[from] });
+    }
+  }
+  return moves;
+}
+
+function applyMoveToBoardForTarget(b: number[], from: number, to: number, refillValue: number, target: number) {
+  const next = [...b];
+  const sum = b[to] + b[from];
+  next[to] = computeToValue(sum, target);
+  next[from] = refillValue;
+  return { next, sum };
+}
+
+function canWinWithinThreeMovesFromInitial(b0: number[], next0: number, next1: number, next2: number, target: number) {
+  const moves0 = listAllMovesForTarget(b0);
+  for (const first of moves0) {
+    const { next: b1, sum: s1 } = applyMoveToBoardForTarget(b0, first.from, first.to, next0, target);
+    if (s1 === target) return true;
+
+    const moves1 = listAllMovesForTarget(b1);
+    for (const second of moves1) {
+      const { next: b2, sum: s2 } = applyMoveToBoardForTarget(b1, second.from, second.to, next1, target);
+      if (s2 === target) return true;
+
+      const moves2 = listAllMovesForTarget(b2);
+      for (const third of moves2) {
+        const { sum: s3 } = applyMoveToBoardForTarget(b2, third.from, third.to, next2, target);
+        if (s3 === target) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function rollFairInitialState(target: number) {
+  // Avoid "first player can win within 3 actions" setups.
+  let guard = 0;
+  while (true) {
+    const board = makeInitialBoard();
+    const next0 = randInt(1, 9);
+    const next1 = randInt(1, 9);
+    const next2 = randInt(1, 9);
+    if (!canWinWithinThreeMovesFromInitial(board, next0, next1, next2, target)) return { board, next0, next1, next2 };
+    guard++;
+    if (guard > 5000) return { board, next0, next1, next2 }; // fallback (should be extremely unlikely)
+  }
+}
+
+function makeNextQueue(first: number, second: number, third: number, length = 80) {
+  const q = [first, second, third];
+  while (q.length < length) q.push(randInt(1, 9));
+  return q;
+}
+
+function tileStyle(value: number, target: number): { background: string; boxShadow: string; borderColor: string } {
+  const v = Math.max(0, Math.min(target, value));
+  const t = v / target;
+  const hue = 330 - 250 * t; // pink -> lime
+  const sat = 92;
+  const light = 72 - t * 10;
+  const bg = `hsl(${hue} ${sat}% ${light}%)`;
+  const border = `hsl(${hue} ${sat}% ${Math.max(45, light - 22)}%)`;
+  const shadow =
+    "0 18px 0 rgba(255,255,255,.42) inset, 0 18px 40px rgba(80,60,130,.18), 0 2px 0 rgba(40,30,70,.16)";
+  return { background: bg, boxShadow: shadow, borderColor: border };
+}
+
+function playerLabel(p: Player) {
+  return p === 1 ? "Player 1" : "Player 2";
+}
+
+function playerAccent(p: Player) {
+  return p === 1 ? "from-sky-400 to-indigo-500" : "from-fuchsia-400 to-rose-500";
+}
+
+type ConfettiPiece = {
+  id: string;
+  left: string;
+  delayMs: number;
+  durationMs: number;
+  sizePx: number;
+  rotateDeg: number;
+  hue: number;
+};
+
+function makeConfetti(count: number): ConfettiPiece[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `${Date.now()}-${i}-${Math.random().toString(16).slice(2)}`,
+    left: `${Math.random() * 100}%`,
+    delayMs: Math.floor(Math.random() * 300),
+    durationMs: 1400 + Math.floor(Math.random() * 1200),
+    sizePx: 6 + Math.floor(Math.random() * 8),
+    rotateDeg: Math.floor(Math.random() * 360),
+    hue: Math.floor(Math.random() * 360),
+  }));
+}
+
+type MoveOverlay = {
+  id: string;
+  value: number;
+  from: number;
+  to: number;
+  fromCenter: { x: number; y: number };
+  toCenter: { x: number; y: number };
+};
+
+type PlannedMove = {
+  from: number;
+  to: number;
+};
+
+function Icon({
+  name,
+  className = "h-8 w-8",
+}: {
+  name: "robot" | "lion" | "peach" | "chick" | "dog" | "warrior" | "lock";
+  className?: string;
+}) {
+  const common = "stroke-zinc-800/70 fill-none stroke-[2.2] stroke-linecap-round stroke-linejoin-round";
+  if (name === "lock") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path d="M20 30v-6c0-8 6-14 12-14s12 6 12 14v6" className={common} />
+        <path
+          d="M18 30h28c2 0 4 2 4 4v14c0 2-2 4-4 4H18c-2 0-4-2-4-4V34c0-2 2-4 4-4Z"
+          fill="#FFFFFF"
+          className="stroke-zinc-800/60 stroke-[2]"
+        />
+        <path d="M32 38v6" className={common} />
+        <path d="M30 38h4" className={common} />
+      </svg>
+    );
+  }
+  if (name === "peach") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path d="M32 14c-7 0-18 9-18 24 0 12 8 18 18 18s18-6 18-18C50 23 39 14 32 14Z" fill="#FF84B1" />
+        <path d="M32 14c-6 2-10 7-12 12" className={common} />
+        <path d="M32 22c6-8 12-10 18-10-3 6-8 10-14 12" fill="#5EE28A" className="stroke-zinc-800/60" />
+        <path d="M32 22c-4-8-10-10-18-10 3 6 8 10 14 12" fill="#6AE6FF" className="stroke-zinc-800/60" />
+        <path d="M26 38h12" className={common} />
+        <path d="M26 44c2 2 10 2 12 0" className={common} />
+      </svg>
+    );
+  }
+  if (name === "lion") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path
+          d="M32 10c-10 0-20 8-20 20 0 14 8 24 20 24s20-10 20-24c0-12-10-20-20-20Z"
+          fill="#FFB84D"
+          className="stroke-zinc-800/60 stroke-[2]"
+        />
+        <path d="M20 26c-4-2-7-6-8-10 6 1 9 4 12 8" fill="#FF8A4D" className="stroke-zinc-800/50" />
+        <path d="M44 26c4-2 7-6 8-10-6 1-9 4-12 8" fill="#FF8A4D" className="stroke-zinc-800/50" />
+        <path d="M24 30c2-2 4-2 6 0" className={common} />
+        <path d="M34 30c2-2 4-2 6 0" className={common} />
+        <path d="M28 38c3 3 5 3 8 0" className={common} />
+        <path d="M30 40c0 3 4 3 4 0" className={common} />
+      </svg>
+    );
+  }
+  if (name === "robot") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path d="M24 10h16v8H24z" fill="#A7F3D0" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M18 18h28c6 0 10 4 10 10v12c0 8-6 14-14 14H22C14 54 8 48 8 40V28c0-6 4-10 10-10Z" fill="#93C5FD" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M22 30h8" className={common} />
+        <path d="M34 30h8" className={common} />
+        <path d="M24 40c4 4 12 4 16 0" className={common} />
+        <path d="M32 6v6" className={common} />
+        <path d="M30 6h4" className={common} />
+      </svg>
+    );
+  }
+  if (name === "chick") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path d="M32 14c-10 0-18 8-18 18s8 20 18 20 18-10 18-20-8-18-18-18Z" fill="#FFE66D" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M26 30h4" className={common} />
+        <path d="M34 30h4" className={common} />
+        <path d="M30 36h4" className={common} />
+        <path d="M30 36l2 3 2-3" fill="#FF8A4D" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M24 18l4 4" className={common} />
+        <path d="M40 18l-4 4" className={common} />
+      </svg>
+    );
+  }
+  if (name === "dog") {
+    return (
+      <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+        <path d="M20 20c0-6 6-10 12-10s12 4 12 10v6c0 10-6 20-12 20S20 36 20 26v-6Z" fill="#F4C7A1" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M18 22c-6 2-8 8-6 14 6 0 10-4 10-10" fill="#EBAA7E" className="stroke-zinc-800/50 stroke-[2]" />
+        <path d="M46 22c6 2 8 8 6 14-6 0-10-4-10-10" fill="#EBAA7E" className="stroke-zinc-800/50 stroke-[2]" />
+        <path d="M28 28h4" className={common} />
+        <path d="M32 36c0 3-4 3-4 0 0-2 4-2 4 0Z" fill="#FF8A4D" className="stroke-zinc-800/60 stroke-[2]" />
+        <path d="M36 28h4" className={common} />
+        <path d="M28 40c4 3 8 3 12 0" className={common} />
+      </svg>
+    );
+  }
+  // warrior
+  return (
+    <svg viewBox="0 0 64 64" className={className} aria-hidden="true">
+      <path d="M16 26c6-10 26-10 32 0v10c0 10-8 18-16 18s-16-8-16-18V26Z" fill="#C7B9FF" className="stroke-zinc-800/60 stroke-[2]" />
+      <path d="M22 22c3-7 17-7 20 0" fill="#7DD3FC" className="stroke-zinc-800/60 stroke-[2]" />
+      <path d="M24 30h6" className={common} />
+      <path d="M34 30h6" className={common} />
+      <path d="M28 40c3 3 5 3 8 0" className={common} />
+      <path d="M10 50l12-12" className={common} />
+      <path d="M10 50l6 2 2 6" className={common} />
+    </svg>
+  );
+}
+
+function JellyImage({
+  src,
+  alt,
+  ring = "rgba(255,170,210,.95)",
+  size = 44,
+  disabled,
+}: {
+  src: string;
+  alt: string;
+  ring?: string;
+  size?: number;
+  disabled?: boolean;
+}) {
+  return (
+    <motion.div
+      className="relative grid place-items-center rounded-[22px]"
+      style={{
+        width: size,
+        height: size,
+        border: `4px solid ${ring}`,
+        boxShadow:
+          "0 14px 0 rgba(255,255,255,.65) inset, 0 22px 44px rgba(120,70,40,.14), 0 2px 0 rgba(40,30,70,.10)",
+        background:
+          "radial-gradient(circle at 30% 25%, rgba(255,255,255,.75), rgba(255,255,255,.35) 40%, rgba(255,255,255,.12) 70%)",
+        opacity: disabled ? 0.75 : 1,
+      }}
+      whileHover={
+        disabled
+          ? undefined
+          : {
+              rotate: [0, -1.2, 1.2, -0.6, 0],
+              y: [0, -1.5, 0],
+              transition: { duration: 0.6 },
+            }
+      }
+    >
+      <motion.img
+        src={src}
+        alt={alt}
+        className="pointer-events-none select-none"
+        style={{
+          width: Math.round(size * 0.82),
+          height: Math.round(size * 0.82),
+          objectFit: "contain",
+          filter: disabled ? "grayscale(25%)" : "none",
+          transform: "translateY(-2px)",
+        }}
+        whileHover={disabled ? undefined : { scale: 1.06, y: -2 }}
+        transition={{ type: "spring", stiffness: 520, damping: 22 }}
+        draggable={false}
+      />
+      <div
+        className="pointer-events-none absolute inset-0 rounded-[22px]"
+        style={{
+          boxShadow: "0 0 0 1px rgba(255,255,255,.55) inset, 0 -10px 20px rgba(255,255,255,.22) inset",
+        }}
+      />
+    </motion.div>
+  );
+}
+
+function JellySelectButton({
+  selected,
+  disabled,
+  onClick,
+  label,
+  subLabel,
+  imgSrc,
+  imgAlt,
+  ring,
+  variant = "row",
+  imgSize = 46,
+}: {
+  selected?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
+  label: string;
+  subLabel?: string;
+  imgSrc: string;
+  imgAlt: string;
+  ring: string;
+  variant?: "row" | "tile";
+  imgSize?: number;
+}) {
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={[
+        "group relative whitespace-nowrap border shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform",
+        variant === "tile"
+          ? "flex flex-col items-center justify-center gap-2 rounded-[28px] px-3 py-3 text-center"
+          : "flex items-center gap-3 rounded-[28px] px-4 py-3 text-left",
+        selected
+          ? "border-white bg-gradient-to-r from-amber-200 to-fuchsia-200 text-zinc-800"
+          : disabled
+            ? "border-white/60 bg-white/55 text-zinc-500 opacity-75"
+            : "border-white/70 bg-white/80 text-zinc-700 hover:brightness-105",
+        disabled ? "cursor-default" : "active:scale-[0.98]",
+      ].join(" ")}
+      whileHover={disabled ? undefined : { y: -1 }}
+      whileTap={disabled ? undefined : { scale: 0.98, y: 0 }}
+      aria-pressed={selected}
+    >
+      <JellyImage src={imgSrc} alt={imgAlt} ring={ring} size={imgSize} disabled={disabled} />
+      <div className={variant === "tile" ? "leading-tight" : "min-w-0"}>
+        {variant !== "tile" && subLabel ? (
+          <div className="text-[10px] font-black tracking-widest text-zinc-600/90">{subLabel}</div>
+        ) : null}
+        <div className={variant === "tile" ? "text-xs font-black tracking-tight" : "text-sm font-black tracking-tight"}>
+          {label}
+        </div>
+      </div>
+      {disabled && variant !== "tile" ? (
+        <span className="ml-auto inline-flex items-center gap-1 rounded-[999px] bg-white/70 px-2 py-1 text-[10px] font-black text-zinc-600 shadow-[0_10px_22px_rgba(90,60,160,.12)]">
+          <Icon name="lock" className="h-4 w-4" />
+          LOCK
+        </span>
+      ) : null}
+      {disabled && variant === "tile" ? (
+        <span className="absolute right-2 top-2 grid h-6 w-6 place-items-center rounded-full bg-white/75 text-zinc-700 shadow-[0_10px_22px_rgba(90,60,160,.12)]">
+          <Icon name="lock" className="h-4 w-4" />
+        </span>
+      ) : null}
+    </motion.button>
+  );
+}
+
+export default function Page() {
+  const [screen, setScreen] = useState<Screen>("menu");
+  const [isPaused, setIsPaused] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const [unlockedDifficulties, setUnlockedDifficulties] = useState<CpuDifficulty[]>(["easy", "normal"]);
+  const [unlockMessage, setUnlockMessage] = useState<string | null>(null);
+  const [showGodVictory, setShowGodVictory] = useState(false);
+  const [pendingWinner, setPendingWinner] = useState<Winner>(null);
+  const pendingWinnerTimeoutRef = useRef<number | null>(null);
+  const [victoryPraise, setVictoryPraise] = useState<string>("");
+
+  // Menu settings (applied on game start)
+  const [menuMode, setMenuMode] = useState<GameMode>("cpu");
+  const [menuTarget, setMenuTarget] = useState<TargetValue>(DEFAULT_TARGET);
+  const [menuFirstTurn, setMenuFirstTurn] = useState<FirstTurn>("random");
+  const [menuDifficulty, setMenuDifficulty] = useState<CpuDifficulty>("normal");
+  const [menuRoomId, setMenuRoomId] = useState<string>("");
+  const [menuOnlineRole, setMenuOnlineRole] = useState<OnlineRole>("host");
+  const [matchId, setMatchId] = useState<number | null>(null);
+  const [matchNotFound, setMatchNotFound] = useState(false);
+
+  // Active game settings
+  const [target, setTarget] = useState<number>(DEFAULT_TARGET);
+  const [board, setBoard] = useState<number[]>(() => makeInitialBoard());
+  const [nextQueue, setNextQueue] = useState<number[]>(() => Array.from({ length: 80 }, () => randInt(1, 9)));
+  const [nextIndex, setNextIndex] = useState(0);
+  const [nextNumber, setNextNumber] = useState<number>(() => randInt(1, 9));
+  const [currentPlayer, setCurrentPlayer] = useState<Player>(1);
+  const [startingPlayer, setStartingPlayer] = useState<Player>(1);
+  const [movesLeft, setMovesLeft] = useState<number>(TURN_ACTIONS);
+  const [mode, setMode] = useState<GameMode>("cpu");
+  const [cpuDifficulty, setCpuDifficulty] = useState<CpuDifficulty>("normal");
+  const [online, setOnline] = useState<OnlineState | null>(null);
+  const [actionDeadlineMs, setActionDeadlineMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [selected, setSelected] = useState<number | null>(null);
+  const [winner, setWinner] = useState<Winner>(null);
+  const [flashIndex, setFlashIndex] = useState<number | null>(null);
+  const [confetti, setConfetti] = useState<ConfettiPiece[]>([]);
+  const [moveOverlay, setMoveOverlay] = useState<MoveOverlay | null>(null);
+  const [isAnimatingMove, setIsAnimatingMove] = useState(false);
+  const [bumpIds, setBumpIds] = useState<number[]>(() => Array.from({ length: TILE_COUNT }, () => 0));
+
+  const flashTimeoutRef = useRef<number | null>(null);
+  const boardWrapRef = useRef<HTMLDivElement | null>(null);
+  const tileRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const prefersReducedMotion = useReducedMotion();
+  const completedOverlayIdRef = useRef<string | null>(null);
+  const touchStartRef = useRef<{ idx: number; x: number; y: number } | null>(null);
+
+  const boardRef = useRef<number[]>(board);
+  const nextQueueRef = useRef<number[]>(nextQueue);
+  const nextIndexRef = useRef<number>(nextIndex);
+  const nextNumberRef = useRef<number>(nextNumber);
+  const currentPlayerRef = useRef<Player>(currentPlayer);
+  const movesLeftRef = useRef<number>(movesLeft);
+  const modeRef = useRef<GameMode>(mode);
+  const cpuDifficultyRef = useRef<CpuDifficulty>(cpuDifficulty);
+  const targetRef = useRef<number>(target);
+  const winnerRef = useRef<Winner>(winner);
+  const cpuTimeoutRef = useRef<number | null>(null);
+  const cpuPlannedLineRef = useRef<PlannedMove[] | null>(null);
+  const onlineChannelRef = useRef<RealtimeChannel | null>(null);
+  const matchChannelRef = useRef<RealtimeChannel | null>(null);
+  const matchIdRef = useRef<number | null>(matchId);
+
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
+  useEffect(() => {
+    nextQueueRef.current = nextQueue;
+  }, [nextQueue]);
+  useEffect(() => {
+    nextIndexRef.current = nextIndex;
+  }, [nextIndex]);
+  useEffect(() => {
+    nextNumberRef.current = nextNumber;
+  }, [nextNumber]);
+  useEffect(() => {
+    currentPlayerRef.current = currentPlayer;
+  }, [currentPlayer]);
+  useEffect(() => {
+    movesLeftRef.current = movesLeft;
+  }, [movesLeft]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    cpuDifficultyRef.current = cpuDifficulty;
+  }, [cpuDifficulty]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("plusBattleUnlockedDifficulties");
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      const valid = parsed.filter((d) => d === "easy" || d === "normal" || d === "hard" || d === "god") as CpuDifficulty[];
+      const uniq = Array.from(new Set(valid));
+      if (uniq.length > 0) setUnlockedDifficulties(uniq);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("plusBattleUnlockedDifficulties", JSON.stringify(unlockedDifficulties));
+    } catch {
+      // ignore
+    }
+  }, [unlockedDifficulties]);
+
+  useEffect(() => {
+    if (!unlockedDifficulties.includes(menuDifficulty)) {
+      setMenuDifficulty(unlockedDifficulties.includes("normal") ? "normal" : "easy");
+    }
+  }, [menuDifficulty, unlockedDifficulties]);
+  useEffect(() => {
+    targetRef.current = target;
+  }, [target]);
+  useEffect(() => {
+    winnerRef.current = winner;
+  }, [winner]);
+  useEffect(() => {
+    matchIdRef.current = matchId;
+  }, [matchId]);
+
+  useEffect(() => {
+    if (!isPaused) return;
+    if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    setSelected(null);
+  }, [isPaused]);
+
+  useEffect(() => {
+    const t = window.setInterval(() => setNowMs(Date.now()), 120);
+    return () => window.clearInterval(t);
+  }, []);
+
+  const isCpuTurn = mode === "cpu" && currentPlayer === 2 && winner === null && screen === "play" && !isPaused;
+
+  const nextPair = useMemo(() => {
+    const q = nextQueue;
+    const idx = nextIndex;
+    const n0 = q[idx] ?? nextNumber;
+    const n1 = q[idx + 1] ?? randInt(1, 9);
+    return { n0, n1 };
+  }, [nextIndex, nextNumber, nextQueue]);
+  const isOnlineLocked = mode === "online" && (!online || !online.ready || online.player !== currentPlayer);
+  const canInteract =
+    winner === null &&
+    pendingWinner === null &&
+    !isProcessing &&
+    !isAnimatingMove &&
+    (!isCpuTurn) &&
+    !isOnlineLocked &&
+    screen === "play" &&
+    !isPaused;
+
+  const statusText = useMemo(() => {
+    if (winner) return `${playerLabel(winner)} Wins!`;
+    return `${playerLabel(currentPlayer)} Turn`;
+  }, [currentPlayer, winner]);
+
+  const movesLeftText = useMemo(() => {
+    if (winner) return "";
+    return `のこり手数：${movesLeft}`;
+  }, [movesLeft, winner]);
+
+  const timeLeftMs = useMemo(() => {
+    if (screen !== "play" || isPaused || winner) return 0;
+    if (!actionDeadlineMs) return 0;
+    return Math.max(0, actionDeadlineMs - nowMs);
+  }, [actionDeadlineMs, isPaused, nowMs, screen, winner]);
+
+  const timeLeftSec = useMemo(() => Math.ceil(timeLeftMs / 1000), [timeLeftMs]);
+
+  function getClientId() {
+    if (typeof window === "undefined") return "server";
+    const k = "plus-battle-client-id";
+    const existing = window.localStorage.getItem(k);
+    if (existing) return existing;
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    window.localStorage.setItem(k, id);
+    return id;
+  }
+
+  async function leaveOnlineRoom() {
+    if (onlineChannelRef.current) {
+      await supabase.removeChannel(onlineChannelRef.current);
+      onlineChannelRef.current = null;
+    }
+    setOnline(null);
+  }
+
+  async function leaveMatchChannel() {
+    if (matchChannelRef.current) {
+      await supabase.removeChannel(matchChannelRef.current);
+      matchChannelRef.current = null;
+    }
+  }
+
+  async function cleanupMatchRecord() {
+    const id = matchIdRef.current;
+    if (!id) return;
+    try {
+      await supabase.from("public_matches").delete().eq("id", id);
+    } catch {
+      // best-effort
+    }
+    setMatchId(null);
+  }
+
+  async function cancelMatchingAndBackToMenu() {
+    await cleanupMatchRecord();
+    await leaveMatchChannel();
+    await leaveOnlineRoom();
+    setMatchNotFound(false);
+    setScreen("menu");
+  }
+
+  useEffect(() => {
+    function onUnload() {
+      // best-effort cleanup so waiting records don't stick around
+      void cleanupMatchRecord();
+      void leaveOnlineRoom();
+    }
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, []);
+
+  function genRoomId() {
+    return Math.random().toString(36).slice(2, 8);
+  }
+
+  async function startRandomMatch() {
+    setScreen("matching");
+    setMatchNotFound(false);
+    setMatchId(null);
+
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const { data: waiting } = await supabase
+        .from("public_matches")
+        .select("id,room_id,status")
+        .eq("status", "waiting")
+        .limit(1)
+        .maybeSingle<PublicMatchRow>();
+
+      if (waiting) {
+        const { data: claimed } = await supabase
+          .from("public_matches")
+          .update({ status: "playing" })
+          .eq("id", waiting.id)
+          .eq("status", "waiting")
+          .select("id,room_id,status")
+          .maybeSingle<PublicMatchRow>();
+
+        if (claimed && claimed.status === "playing") {
+          // We are guest (P2)
+          setMenuMode("online");
+          setMenuOnlineRole("guest");
+          setMenuRoomId(claimed.room_id);
+          setMatchId(claimed.id);
+          await joinOnlineRoom(claimed.room_id, "guest");
+          setScreen("play");
+          return;
+        }
+        // Lost race: retry
+        continue;
+      }
+
+      // No waiting: create and wait as host (P1)
+      const roomId = genRoomId();
+      const { data: created } = await supabase
+        .from("public_matches")
+        .insert({ room_id: roomId, status: "waiting" })
+        .select("id,room_id,status")
+        .maybeSingle<PublicMatchRow>();
+
+      if (!created) continue;
+
+      setMenuMode("online");
+      setMenuOnlineRole("host");
+      setMenuRoomId(created.room_id);
+      setMatchId(created.id);
+
+      // Listen for status -> playing
+      await leaveMatchChannel();
+      const mc = supabase
+        .channel(`plus-battle-match-${created.id}`)
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "public_matches", filter: `id=eq.${created.id}` },
+          async (payload) => {
+            const row = payload.new as PublicMatchRow;
+            if (row.status !== "playing") return;
+            // Start online as host and broadcast initial state.
+            await joinOnlineRoom(row.room_id, "host");
+
+            const appliedTarget = menuTarget;
+            setTarget(appliedTarget);
+            setMode("online");
+            setCpuDifficulty("easy");
+            setStartingPlayer(1);
+            setCurrentPlayer(1);
+            setMovesLeft(TURN_ACTIONS);
+            setSelected(null);
+            setWinner(null);
+            setFlashIndex(null);
+            setConfetti([]);
+            setMoveOverlay(null);
+            setIsAnimatingMove(false);
+            completedOverlayIdRef.current = null;
+            setIsPaused(false);
+            setScreen("play");
+
+            const rolled = rollFairInitialState(appliedTarget);
+            const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+            setBoard(rolled.board);
+            setNextQueue(q);
+            setNextIndex(0);
+            setNextNumber(q[0]!);
+
+            const newDeadline = Date.now() + 30_000;
+            setActionDeadlineMs(newDeadline);
+
+            await broadcastOnlineState({
+              target: appliedTarget,
+              board: rolled.board,
+              nextNumber: q[0]!,
+              nextQueue: q,
+              nextIndex: 0,
+              currentPlayer: 1,
+              movesLeft: TURN_ACTIONS,
+              winner: null,
+              startingPlayer: 1,
+              actionDeadlineMs: newDeadline,
+            });
+          },
+        )
+        .subscribe();
+      matchChannelRef.current = mc;
+
+      // Join room channel early (optional but helps)
+      await joinOnlineRoom(created.room_id, "host");
+      return;
+    }
+
+    // timeout -> show "not found" and wait for user action
+    setMatchNotFound(true);
+  }
+
+  async function joinOnlineRoom(roomId: string, role: OnlineRole) {
+    await leaveOnlineRoom();
+    const clientId = getClientId();
+    const player: Player = role === "host" ? 1 : 2;
+
+    const channel = supabase.channel(`plus-battle-room-${roomId}`, {
+      config: { broadcast: { ack: true }, presence: { key: clientId } },
+    });
+
+    channel.on("broadcast", { event: "state" }, (payload) => {
+      const data = payload.payload as unknown as OnlineBroadcastState;
+      if (!data || data.clientId === clientId) return;
+      // apply authoritative state
+      const prev = boardRef.current;
+      setTarget(data.target);
+      setMode("online");
+      setCpuDifficulty("easy");
+      setStartingPlayer(data.startingPlayer);
+      setCurrentPlayer(data.currentPlayer);
+      setMovesLeft(data.movesLeft);
+      setWinner(data.winner);
+      if (typeof data.actionDeadlineMs === "number") setActionDeadlineMs(data.actionDeadlineMs);
+      setFlashIndex(null);
+      setSelected(null);
+      setIsAnimatingMove(false);
+      setMoveOverlay(null);
+      completedOverlayIdRef.current = null;
+
+      setBoard(data.board);
+      bumpForChanges(prev, data.board);
+      setNextQueue(Array.isArray(data.nextQueue) ? data.nextQueue : []);
+      setNextIndex(typeof data.nextIndex === "number" ? data.nextIndex : 0);
+      setNextNumber(typeof data.nextNumber === "number" ? data.nextNumber : randInt(1, 9));
+      setOnline((o) => (o ? { ...o, ready: true } : o));
+    });
+
+    channel.on("presence", { event: "sync" }, () => {
+      // no-op for now
+    });
+
+    await channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await channel.track({ role, player });
+        setOnline({ enabled: true, roomId, role, player, clientId, ready: role === "host" });
+      }
+    });
+
+    onlineChannelRef.current = channel;
+  }
+
+  async function broadcastOnlineState(nextState: {
+    target: number;
+    board: number[];
+    nextNumber: number;
+    nextQueue: number[];
+    nextIndex: number;
+    currentPlayer: Player;
+    movesLeft: number;
+    winner: Winner;
+    startingPlayer: Player;
+    actionDeadlineMs?: number | null;
+  }) {
+    if (!onlineChannelRef.current || !online) return;
+    await onlineChannelRef.current.send({
+      type: "broadcast",
+      event: "state",
+      payload: { ...nextState, clientId: online.clientId },
+    });
+  }
+
+  function startGame() {
+    setUnlockMessage(null);
+    setShowGodVictory(false);
+    setPendingWinner(null);
+    if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
+    pendingWinnerTimeoutRef.current = null;
+    // apply menu settings
+    const appliedMode = menuMode;
+    const appliedTarget = menuTarget;
+    const appliedDifficulty = menuDifficulty;
+    const first: Player =
+      menuFirstTurn === "random" ? (Math.random() < 0.5 ? 1 : 2) : menuFirstTurn === "p1" ? 1 : 2;
+
+    if (appliedMode === "online") {
+      const roomId = (menuRoomId || "").trim();
+      if (!roomId) return;
+      void joinOnlineRoom(roomId, menuOnlineRole).then(() => {
+        setTarget(appliedTarget);
+        setMode("online");
+        setCpuDifficulty("easy");
+        setStartingPlayer(1);
+        setCurrentPlayer(1);
+        setMovesLeft(TURN_ACTIONS);
+        setSelected(null);
+        setWinner(null);
+        setFlashIndex(null);
+        setConfetti([]);
+        setMoveOverlay(null);
+        setIsAnimatingMove(false);
+        completedOverlayIdRef.current = null;
+        setIsPaused(false);
+        setScreen("play");
+
+        if (menuOnlineRole === "host") {
+          const rolled = rollFairInitialState(appliedTarget);
+          const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+          setBoard(rolled.board);
+          setNextQueue(q);
+          setNextIndex(0);
+          setNextNumber(q[0]!);
+          void broadcastOnlineState({
+            target: appliedTarget,
+            board: rolled.board,
+            nextNumber: q[0]!,
+            nextQueue: q,
+            nextIndex: 0,
+            currentPlayer: 1,
+            movesLeft: TURN_ACTIONS,
+            winner: null,
+            startingPlayer: 1,
+          });
+        } else {
+          // guest waits for host state
+          setBoard(makeInitialBoard());
+          const q = Array.from({ length: 80 }, () => randInt(1, 9));
+          setNextQueue(q);
+          setNextIndex(0);
+          setNextNumber(q[0]!);
+        }
+      });
+      return;
+    }
+
+    setTarget(appliedTarget);
+    setMode(appliedMode);
+    setCpuDifficulty(appliedDifficulty);
+    setStartingPlayer(first);
+    setCurrentPlayer(first);
+    setMovesLeft(TURN_ACTIONS);
+    const rolled = rollFairInitialState(appliedTarget);
+    const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+    setBoard(rolled.board);
+    setNextQueue(q);
+    setNextIndex(0);
+    setNextNumber(q[0]!);
+    setSelected(null);
+    setWinner(null);
+    setFlashIndex(null);
+    setConfetti([]);
+    setMoveOverlay(null);
+    setIsAnimatingMove(false);
+    completedOverlayIdRef.current = null;
+    setIsPaused(false);
+    setScreen("play");
+
+    // start action timer for local/cpu
+    setActionDeadlineMs(Date.now() + 30_000);
+  }
+
+  function backToMenu() {
+    if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    setIsPaused(false);
+    setUnlockMessage(null);
+    setShowGodVictory(false);
+    setPendingWinner(null);
+    if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
+    pendingWinnerTimeoutRef.current = null;
+    setWinner(null);
+    setMoveOverlay(null);
+    setIsAnimatingMove(false);
+    completedOverlayIdRef.current = null;
+    void cleanupMatchRecord();
+    void leaveMatchChannel();
+    void leaveOnlineRoom();
+    setScreen("menu");
+  }
+
+  function reset(nextMode: GameMode = modeRef.current) {
+    if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    setUnlockMessage(null);
+    setShowGodVictory(false);
+    setPendingWinner(null);
+    if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
+    pendingWinnerTimeoutRef.current = null;
+    const rolled = rollFairInitialState(targetRef.current);
+    setBoard(rolled.board);
+    const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+    setNextQueue(q);
+    setNextIndex(0);
+    setNextNumber(q[0]!);
+    setCurrentPlayer(startingPlayer);
+    setMovesLeft(TURN_ACTIONS);
+    setMode(nextMode);
+    setSelected(null);
+    setWinner(null);
+    setFlashIndex(null);
+    setConfetti([]);
+    setMoveOverlay(null);
+    setIsAnimatingMove(false);
+    completedOverlayIdRef.current = null;
+    setBumpIds(Array.from({ length: TILE_COUNT }, () => 0));
+    setActionDeadlineMs(Date.now() + 30_000);
+    cpuPlannedLineRef.current = null;
+
+    if (nextMode === "online" && online) {
+      void broadcastOnlineState({
+        target: targetRef.current,
+        board: rolled.board,
+        nextNumber: q[0]!,
+        nextQueue: q,
+        nextIndex: 0,
+        currentPlayer: startingPlayer,
+        movesLeft: TURN_ACTIONS,
+        winner: null,
+        startingPlayer,
+        actionDeadlineMs: Date.now() + 30_000,
+      });
+    }
+  }
+
+  function triggerFlash(idx: number) {
+    if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    setFlashIndex(idx);
+    flashTimeoutRef.current = window.setTimeout(() => setFlashIndex(null), 420);
+  }
+
+  function win(p: Player) {
+    if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
+    setPendingWinner(p);
+    setSelected(null);
+    setConfetti(makeConfetti(90));
+    const praises = ["ナイスプラス！", "完璧な計算！", "天才か？", "読みが鋭い！", "神業…！", "しびれる一手！"];
+    setVictoryPraise(praises[Math.floor(Math.random() * praises.length)]!);
+    pendingWinnerTimeoutRef.current = window.setTimeout(() => {
+      setWinner(p);
+      setPendingWinner(null);
+      pendingWinnerTimeoutRef.current = null;
+    }, 500);
+  }
+
+  useEffect(() => {
+    if (!winner) return;
+    if (modeRef.current !== "cpu") return;
+    if (winner !== 1) return;
+
+    const d = cpuDifficultyRef.current;
+    if (d === "god") {
+      setShowGodVictory(true);
+      // gold/silver burst
+      try {
+        confettiBurst({
+          particleCount: 220,
+          spread: 85,
+          origin: { y: 0.65 },
+          colors: ["#D4AF37", "#C0C0C0", "#FFF1A8", "#E6E6E6"],
+        });
+        window.setTimeout(() => {
+          confettiBurst({
+            particleCount: 160,
+            spread: 75,
+            origin: { y: 0.25 },
+            colors: ["#D4AF37", "#C0C0C0", "#FFF1A8", "#E6E6E6"],
+          });
+        }, 220);
+      } catch {
+        // ignore
+      }
+    }
+    if (d === "normal") {
+      setUnlockedDifficulties((u) => {
+        if (u.includes("hard")) return u;
+        setUnlockMessage("Hardモードが解放されました！");
+        return [...u, "hard"];
+      });
+    } else if (d === "hard") {
+      setUnlockedDifficulties((u) => {
+        if (u.includes("god")) return u;
+        setUnlockMessage("Godモードが解放されました！");
+        return [...u, "god"];
+      });
+    }
+  }, [winner]);
+
+  function bumpForChanges(prev: number[], next: number[]) {
+    setBumpIds((ids) => ids.map((id, i) => (prev[i] === next[i] ? id : id + 1)));
+  }
+
+  function endTurnOrContinue(didWin: boolean) {
+    if (didWin) return;
+    const after = Math.max(0, movesLeftRef.current - 1);
+    if (after === 0) {
+      setMovesLeft(TURN_ACTIONS);
+      setCurrentPlayer((p) => (p === 1 ? 2 : 1));
+    } else {
+      setMovesLeft(after);
+    }
+  }
+
+  function endTurnNow() {
+    if (winnerRef.current) return;
+    if (movesLeftRef.current === TURN_ACTIONS) return; // prevent accidental skip before doing anything
+    cpuPlannedLineRef.current = null;
+
+    setMovesLeft(TURN_ACTIONS);
+    setCurrentPlayer((p) => (p === 1 ? 2 : 1));
+
+    const newDeadline = Date.now() + 30_000;
+    setActionDeadlineMs(newDeadline);
+
+    if (modeRef.current === "online" && online && online.player === currentPlayerRef.current) {
+      const nextPlayer: Player = currentPlayerRef.current === 1 ? 2 : 1;
+      void broadcastOnlineState({
+        target: targetRef.current,
+        board: boardRef.current,
+        nextNumber: nextNumberRef.current,
+        nextQueue: nextQueueRef.current,
+        nextIndex: nextIndexRef.current,
+        currentPlayer: nextPlayer,
+        movesLeft: TURN_ACTIONS,
+        winner: null,
+        startingPlayer,
+        actionDeadlineMs: newDeadline,
+      });
+    }
+  }
+
+  function consumeNextAfterUse() {
+    const q = nextQueueRef.current.length ? [...nextQueueRef.current] : Array.from({ length: 80 }, () => randInt(1, 9));
+    let idx = nextIndexRef.current;
+    const used = q[idx] ?? randInt(1, 9);
+    idx += 1;
+    if (idx >= q.length) {
+      while (q.length < idx + 80) q.push(randInt(1, 9));
+    }
+    const nextNum = q[idx] ?? randInt(1, 9);
+    setNextQueue(q);
+    setNextIndex(idx);
+    setNextNumber(nextNum);
+    return { used, q, idx, nextNum };
+  }
+
+  function applyMove(from: number, to: number) {
+    const prev = boardRef.current;
+    const next = [...prev];
+    const sum = prev[to] + prev[from];
+    const t = targetRef.current;
+    const computedToValue = sum === t ? t : sum > t ? sum % t : sum;
+    next[to] = computedToValue;
+    const { used, q, idx, nextNum } = consumeNextAfterUse();
+    next[from] = used;
+
+    const didWin = sum === t;
+    const shouldFlash = sum > t;
+
+    setBoard(next);
+    bumpForChanges(prev, next);
+    if (shouldFlash) triggerFlash(to);
+    if (didWin) win(currentPlayerRef.current);
+    endTurnOrContinue(didWin);
+    if (movesLeftRef.current - 1 <= 0) cpuPlannedLineRef.current = null;
+
+    // Reset action timer after a move completes
+    const newDeadline = Date.now() + 30_000;
+    setActionDeadlineMs(newDeadline);
+
+    // Online sync (authoritative by active player)
+    if (modeRef.current === "online" && online && online.player === currentPlayerRef.current) {
+      const afterMovesLeft = Math.max(0, movesLeftRef.current - 1);
+      const nextPlayer: Player = afterMovesLeft === 0 ? (currentPlayerRef.current === 1 ? 2 : 1) : currentPlayerRef.current;
+      const movesLeftNext = afterMovesLeft === 0 ? 2 : afterMovesLeft;
+      void broadcastOnlineState({
+        target: t,
+        board: next,
+        nextNumber: nextNum,
+        nextQueue: q,
+        nextIndex: idx,
+        currentPlayer: nextPlayer,
+        movesLeft: movesLeftNext,
+        winner: didWin ? currentPlayerRef.current : null,
+        startingPlayer,
+        actionDeadlineMs: newDeadline,
+      });
+    }
+  }
+
+  function centerInBoard(el: HTMLElement) {
+    const boardEl = boardWrapRef.current;
+    if (!boardEl) return null;
+    const b = boardEl.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    return { x: r.left - b.left + r.width / 2, y: r.top - b.top + r.height / 2 };
+  }
+
+  function startMove(from: number, to: number) {
+    const fromEl = tileRefs.current[from];
+    const toEl = tileRefs.current[to];
+    const fromCenter = fromEl ? centerInBoard(fromEl) : null;
+    const toCenter = toEl ? centerInBoard(toEl) : null;
+
+    setIsProcessing(true);
+    if (prefersReducedMotion || !fromCenter || !toCenter) {
+      applyMove(from, to);
+      window.setTimeout(() => setIsProcessing(false), 0);
+      return;
+    }
+
+    setIsAnimatingMove(true);
+    completedOverlayIdRef.current = null;
+    setMoveOverlay({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      value: boardRef.current[from],
+      from,
+      to,
+      fromCenter,
+      toCenter,
+    });
+  }
+
+  function neighborIndex(idx: number, dir: "up" | "down" | "left" | "right") {
+    const r = Math.floor(idx / BOARD_SIZE);
+    const c = idx % BOARD_SIZE;
+    if (dir === "up") return r > 0 ? idx - BOARD_SIZE : null;
+    if (dir === "down") return r < BOARD_SIZE - 1 ? idx + BOARD_SIZE : null;
+    if (dir === "left") return c > 0 ? idx - 1 : null;
+    return c < BOARD_SIZE - 1 ? idx + 1 : null;
+  }
+
+  function handleTouchStart(idx: number, e: React.TouchEvent) {
+    if (!canInteract) return;
+    const t = e.touches[0];
+    if (!t) return;
+    touchStartRef.current = { idx, x: t.clientX, y: t.clientY };
+  }
+
+  function handleTouchEnd(idx: number, e: React.TouchEvent) {
+    if (!canInteract) return;
+    const start = touchStartRef.current;
+    touchStartRef.current = null;
+    if (!start || start.idx !== idx) return;
+
+    const t = e.changedTouches[0];
+    if (!t) return;
+    const dx = t.clientX - start.x;
+    const dy = t.clientY - start.y;
+
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+    const threshold = 26;
+    if (absX < threshold && absY < threshold) return;
+
+    const dir: "up" | "down" | "left" | "right" =
+      absX >= absY ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up");
+    const to = neighborIndex(idx, dir);
+    if (to === null) return;
+    startMove(idx, to);
+  }
+
+  function listAllMoves(b: number[]): Array<{ from: number; to: number; sum: number; toValue: number }> {
+    const moves: Array<{ from: number; to: number; sum: number; toValue: number }> = [];
+    const t = targetRef.current;
+    for (let from = 0; from < TILE_COUNT; from++) {
+      for (let to = 0; to < TILE_COUNT; to++) {
+        if (from === to) continue;
+        if (!isAdjacent(from, to)) continue;
+        const sum = b[to] + b[from];
+        const toValue = sum === t ? t : sum > t ? sum % t : sum;
+        moves.push({ from, to, sum, toValue });
+      }
+    }
+    return moves;
+  }
+
+  function applyMoveToBoard(b: number[], from: number, to: number, refillValue: number) {
+    const next = [...b];
+    const sum = b[to] + b[from];
+    const t = targetRef.current;
+    const computedToValue = sum === t ? t : sum > t ? sum % t : sum;
+    next[to] = computedToValue;
+    next[from] = refillValue;
+    return { next, sum };
+  }
+
+  function opponentHasImmediateWin(b: number[]) {
+    const t = targetRef.current;
+    return listAllMoves(b).some((m) => m.sum === t);
+  }
+
+  function evaluateBoardForCpu(b: number[]) {
+    // Prefer consolidating larger numbers into the "bottom-right" (index 3) to feel like a center pile.
+    const t = targetRef.current;
+    const weights = [1.0, 1.2, 1.2, 1.5];
+    const weighted = b.reduce((acc, v, i) => acc + v * weights[i]!, 0);
+    const closeness = Math.max(...b.map((v) => -Math.abs(t - v)));
+    const adjPairs: Array<[number, number]> = [
+      [0, 1],
+      [0, 2],
+      [1, 3],
+      [2, 3],
+    ];
+    const adjBonus = adjPairs.reduce((acc, [a, c]) => {
+      const va = b[a]!;
+      const vb = b[c]!;
+      const bigPair = Math.min(va, vb); // reward having two big numbers adjacent
+      const near = -Math.abs(t - (va + vb)); // reward adjacency that could combine toward target
+      return acc + bigPair * 1.4 + near * 0.25;
+    }, 0);
+    const scale = Math.max(1, t / 25); // larger goals emphasize long-game structure
+    return weighted * 2 + closeness * 1.5 + adjBonus * 0.12 * scale;
+  }
+
+  function findWinningLineExact(bStart: number[], idx: number, k: number): PlannedMove | null {
+    const q = nextQueueRef.current;
+    const t = targetRef.current;
+    function nextAt(i: number) {
+      const v = q[i];
+      return typeof v === "number" ? v : randInt(1, 9);
+    }
+    function rec(b: number[], i: number, left: number, first: PlannedMove | null): PlannedMove | null {
+      if (left <= 0) return null;
+      const moves = listAllMoves(b);
+      const refill = nextAt(i);
+      for (const m of moves) {
+        const { next: b2, sum } = applyMoveToBoard(b, m.from, m.to, refill);
+        const f = first ?? { from: m.from, to: m.to };
+        if (sum === t) return f;
+        const r = rec(b2, i + 1, left - 1, f);
+        if (r) return r;
+      }
+      return null;
+    }
+    return rec(bStart, idx, k, null);
+  }
+
+  function opponentCanWinIn2ExactFromQueue(bStart: number[], idx: number) {
+    const q = nextQueueRef.current;
+    const t = targetRef.current;
+    const n0 = q[idx] ?? randInt(1, 9);
+    const n1 = q[idx + 1] ?? randInt(1, 9);
+    const moves1 = listAllMoves(bStart);
+    for (const m1 of moves1) {
+      const { next: b1, sum: s1 } = applyMoveToBoard(bStart, m1.from, m1.to, n0);
+      if (s1 === t) return true;
+      const moves2 = listAllMoves(b1);
+      for (const m2 of moves2) {
+        const { sum: s2 } = applyMoveToBoard(b1, m2.from, m2.to, n1);
+        if (s2 === t) return true;
+      }
+    }
+    return false;
+  }
+
+  function opponentCanWinIn3MovesExact(bStart: number[], idx: number) {
+    const q = nextQueueRef.current;
+    const t = targetRef.current;
+    function nextAt(i: number) {
+      const v = q[i];
+      return typeof v === "number" ? v : randInt(1, 9);
+    }
+    const moves0 = listAllMoves(bStart);
+    const r0 = nextAt(idx);
+    for (const m0 of moves0) {
+      const { next: b1, sum: s1 } = applyMoveToBoard(bStart, m0.from, m0.to, r0);
+      if (s1 === t) return true;
+      const moves1 = listAllMoves(b1);
+      const r1 = nextAt(idx + 1);
+      for (const m1 of moves1) {
+        const { next: b2, sum: s2 } = applyMoveToBoard(b1, m1.from, m1.to, r1);
+        if (s2 === t) return true;
+        const moves2 = listAllMoves(b2);
+        const r2 = nextAt(idx + 2);
+        for (const m2 of moves2) {
+          const { sum: s3 } = applyMoveToBoard(b2, m2.from, m2.to, r2);
+          if (s3 === t) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function planCpuMove(): PlannedMove | null {
+    const existing = cpuPlannedLineRef.current;
+    if (existing && existing.length > 0) {
+      return existing.shift() ?? null;
+    }
+
+    const b0 = boardRef.current;
+    const idx0 = nextIndexRef.current;
+    const t = targetRef.current;
+    const d = cpuDifficultyRef.current;
+    const remaining = Math.min(TURN_ACTIONS, Math.max(1, movesLeftRef.current));
+
+    const moves0 = listAllMoves(b0);
+    if (moves0.length === 0) return null;
+
+    type Line = { moves: PlannedMove[]; leaf: number[]; leafIdx: number; winAt: number | null };
+
+    function nextAt(i: number) {
+      const v = nextQueueRef.current[i];
+      return typeof v === "number" ? v : randInt(1, 9);
+    }
+
+    function enumerateLines(b: number[], idx: number, depth: number, prefix: PlannedMove[] = []): Line[] {
+      if (depth <= 0) return [{ moves: prefix, leaf: b, leafIdx: idx, winAt: null }];
+      const moves = listAllMoves(b);
+      if (moves.length === 0) return [{ moves: prefix, leaf: b, leafIdx: idx, winAt: null }];
+      const refill = nextAt(idx);
+      const out: Line[] = [];
+      for (const m of moves) {
+        const { next: b2, sum } = applyMoveToBoard(b, m.from, m.to, refill);
+        const nextPrefix = [...prefix, { from: m.from, to: m.to }];
+        if (sum === t) {
+          out.push({ moves: nextPrefix, leaf: b2, leafIdx: idx + 1, winAt: nextPrefix.length });
+          continue;
+        }
+        out.push(...enumerateLines(b2, idx + 1, depth - 1, nextPrefix));
+      }
+      return out;
+    }
+
+    function pickLineByRules(): PlannedMove[] {
+      // OFFENSE priority per difficulty
+      if (d === "normal") {
+        const win = findWinningLineExact(b0, idx0, Math.min(2, remaining));
+        if (win) return [win];
+      } else {
+        const win = findWinningLineExact(b0, idx0, remaining);
+        if (win) return [win];
+      }
+
+      if (d === "easy") {
+        const refill0 = nextAt(idx0);
+        const candidates = moves0.map((m) => {
+          const { next: b1 } = applyMoveToBoard(b0, m.from, m.to, refill0);
+          return { first: { from: m.from, to: m.to }, forbidden: opponentHasImmediateWin(b1) };
+        });
+        const safe = candidates.filter((c) => !c.forbidden);
+        const pick = (safe.length ? safe : candidates)[Math.floor(Math.random() * (safe.length ? safe.length : candidates.length))]!;
+        return [pick.first];
+      }
+
+      const lines = enumerateLines(b0, idx0, remaining);
+
+      const scored = lines.map((ln) => {
+        const hasImmediate = opponentHasImmediateWin(ln.leaf);
+        const hardThreat = d === "hard" ? opponentCanWinIn2ExactFromQueue(ln.leaf, ln.leafIdx) : false;
+        const godThreat = d === "god" ? opponentCanWinIn3MovesExact(ln.leaf, ln.leafIdx) : false;
+        const safe =
+          d === "normal"
+            ? !hasImmediate
+            : d === "hard"
+              ? !hasImmediate && !hardThreat
+              : !hasImmediate && !godThreat;
+        const winScore = ln.winAt ? 1e12 - ln.winAt * 1e8 : 0;
+        const score = winScore + (safe ? 1e9 : 0) + evaluateBoardForCpu(ln.leaf) + Math.random() * 0.02;
+        return { ln, safe, score };
+      });
+
+      const safeLines = scored.filter((s) => s.safe);
+      const pool = safeLines.length ? safeLines : scored;
+      pool.sort((a, b) => b.score - a.score);
+      return pool[0]!.ln.moves;
+    }
+
+    const line = pickLineByRules();
+    // Execute the full planned line consistently across the turn.
+    const queue = [...line];
+    const first = queue.shift() ?? null;
+    cpuPlannedLineRef.current = queue;
+    return first;
+  }
+
+  function handleTileClick(idx: number) {
+    if (!canInteract) return;
+
+    if (selected === null) {
+      setSelected(idx);
+      return;
+    }
+
+    if (selected === idx) {
+      setSelected(null);
+      return;
+    }
+
+    if (!isAdjacent(selected, idx)) {
+      setSelected(idx);
+      return;
+    }
+
+    const from = selected;
+    const to = idx;
+    setSelected(null);
+    startMove(from, to);
+  }
+
+  function finishMove() {
+    if (!moveOverlay) return;
+    if (completedOverlayIdRef.current === moveOverlay.id) return;
+    completedOverlayIdRef.current = moveOverlay.id;
+    const { from, to } = moveOverlay;
+
+    setMoveOverlay(null);
+    setIsAnimatingMove(false);
+    applyMove(from, to);
+    window.setTimeout(() => setIsProcessing(false), 0);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCpuTurn) return;
+    if (winnerRef.current) return;
+    if (isAnimatingMove) return;
+    if (movesLeftRef.current <= 0) return;
+
+    if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+
+    cpuTimeoutRef.current = window.setTimeout(() => {
+      if (modeRef.current !== "cpu") return;
+      if (winnerRef.current) return;
+      if (currentPlayerRef.current !== 2) return;
+      if (movesLeftRef.current <= 0) return;
+      if (isAnimatingMove) return;
+
+      const planned = planCpuMove();
+      if (!planned) return;
+
+      setSelected(null);
+      startMove(planned.from, planned.to);
+    }, 1000);
+
+    return () => {
+      if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCpuTurn, isAnimatingMove, movesLeft, board, nextNumber, nextIndex, cpuDifficulty]);
+
+  useEffect(() => {
+    if (mode !== "cpu" || currentPlayer !== 2) cpuPlannedLineRef.current = null;
+  }, [currentPlayer, mode]);
+
+  function randomLegalMove(): PlannedMove | null {
+    const moves = listAllMoves(boardRef.current);
+    if (moves.length === 0) return null;
+    const m = moves[Math.floor(Math.random() * moves.length)]!;
+    return { from: m.from, to: m.to };
+  }
+
+  useEffect(() => {
+    if (screen !== "play" || isPaused || winner) return;
+    if (isAnimatingMove || moveOverlay) return;
+    if (timeLeftMs > 0) return;
+    if (mode === "cpu" && currentPlayer === 2) return;
+    if (mode === "online" && (!online || online.player !== currentPlayer)) return;
+
+    const planned = randomLegalMove();
+    if (!planned) return;
+    setSelected(null);
+    startMove(planned.from, planned.to);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode]);
+
+  return (
+    <main className="min-h-[100dvh] text-zinc-900">
+      {/* Cream polka dots (back layer) */}
+      <div
+        className="fixed inset-0 -z-20"
+        style={{
+          backgroundColor: "#FFF4DE",
+          backgroundImage:
+            "radial-gradient(circle at 12px 12px, rgba(160,110,70,.14) 2px, transparent 2.6px)," +
+            "radial-gradient(circle at 8px 8px, rgba(255,155,205,.10) 1.6px, transparent 2.2px)",
+          backgroundSize: "24px 24px, 20px 20px",
+        }}
+      />
+
+      {/* Floating Background (between dots and panels) */}
+      <div className="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
+        {[
+          { left: "12%", top: "72%", size: 140, color: "rgba(255,140,190,.30)" },
+          { left: "28%", top: "20%", size: 110, color: "rgba(255,210,120,.30)" },
+          { left: "52%", top: "58%", size: 170, color: "rgba(140,255,205,.30)" },
+          { left: "72%", top: "28%", size: 120, color: "rgba(150,200,255,.30)" },
+          { left: "86%", top: "66%", size: 180, color: "rgba(255,170,120,.30)" },
+          { left: "40%", top: "40%", size: 100, color: "rgba(210,160,255,.28)" },
+          { left: "62%", top: "82%", size: 120, color: "rgba(120,255,240,.26)" },
+          { left: "18%", top: "36%", size: 90, color: "rgba(255,210,235,.26)" },
+        ].map((b, i) => (
+          <motion.div
+            key={i}
+            className="absolute"
+            style={{ left: b.left, top: b.top, width: b.size, height: b.size, opacity: 0.3 }}
+            animate={{
+              y: [0, -30, 0],
+              rotate: [0, 180, 360],
+            }}
+            transition={{
+              duration: 10 + (i % 4) * 3,
+              repeat: Infinity,
+              ease: "easeInOut",
+              delay: i * 0.35,
+            }}
+          >
+            <div
+              className="h-full w-full rounded-[44px]"
+              style={{
+                background: `radial-gradient(circle at 30% 25%, rgba(255,255,255,.60), transparent 55%), ${b.color}`,
+                boxShadow: "0 30px 90px rgba(120,70,40,.10)",
+              }}
+            />
+          </motion.div>
+        ))}
+      </div>
+      <div className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center px-4 py-4 md:py-6">
+        <AnimatePresence mode="wait">
+        {screen === "menu" ? (
+          <motion.div
+            key="menu"
+            className="w-full"
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+          >
+            <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-4 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
+              <header className="space-y-1">
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
+                <motion.div
+                  className="text-4xl font-black tracking-tight md:text-5xl"
+                  initial={{ scale: 0.9, y: 6, rotate: -1, opacity: 0 }}
+                  animate={{
+                    scale: [1, 1.03, 1],
+                    y: [0, -2, 0],
+                    rotate: [0, -0.6, 0],
+                    opacity: 1,
+                  }}
+                  transition={{
+                    type: "tween",
+                    duration: 0.55,
+                    ease: "easeInOut",
+                    repeat: Infinity,
+                    repeatDelay: 5.5,
+                  }}
+                  style={{
+                    textShadow:
+                      "0 3px 0 rgba(255,255,255,.85), 0 10px 26px rgba(120,70,40,.16), 0 1px 0 rgba(40,30,70,.12)",
+                    WebkitTextStroke: "6px rgba(160,210,255,.55)",
+                    paintOrder: "stroke fill",
+                  }}
+                >
+                  <span
+                    style={{
+                      WebkitTextStroke: "10px rgba(255,170,210,.40)",
+                      paintOrder: "stroke fill",
+                    }}
+                    className="bg-gradient-to-r from-pink-400 via-fuchsia-400 to-sky-400 bg-clip-text text-transparent"
+                  >
+                    ぷるぷらす
+                  </span>
+                </motion.div>
+                <div className="text-3xl font-black tracking-tight md:text-4xl">モード選択</div>
+                <div className="text-sm font-semibold text-zinc-600 md:text-base">
+                  スワイプ or クリックで合体。ぴったり {menuTarget} を狙おう！
+                </div>
+              </header>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-xs font-black tracking-widest text-zinc-700">対戦モード</div>
+                    <div className="flex items-center gap-2 text-[10px] font-black text-zinc-600">
+                      <JellyImage src="/images/vs_player.png" alt="対人" ring="rgba(255,170,210,.95)" size={34} />
+                      <JellyImage src="/images/vs_cpu.png" alt="CPU" ring="rgba(150,200,255,.95)" size={34} />
+                      <JellyImage src="/images/vs_online.png" alt="オンライン" ring="rgba(160,255,210,.95)" size={34} />
+                    </div>
+                  </div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    <JellySelectButton
+                      selected={menuMode === "local"}
+                      onClick={() => setMenuMode("local")}
+                      label="対人"
+                      variant="tile"
+                      imgSrc="/images/vs_player.png"
+                      imgAlt="対人"
+                      ring="rgba(255,170,210,.95)"
+                      imgSize={40}
+                    />
+                    <JellySelectButton
+                      selected={menuMode === "cpu"}
+                      onClick={() => setMenuMode("cpu")}
+                      label="CPU"
+                      variant="tile"
+                      imgSrc="/images/vs_cpu.png"
+                      imgAlt="CPU"
+                      ring="rgba(150,200,255,.95)"
+                      imgSize={40}
+                    />
+                    <JellySelectButton
+                      selected={menuMode === "online"}
+                      onClick={() => setMenuMode("online")}
+                      label="オンライン"
+                      variant="tile"
+                      imgSrc="/images/vs_online.png"
+                      imgAlt="オンライン"
+                      ring="rgba(160,255,210,.95)"
+                      imgSize={40}
+                    />
+                  </div>
+                </div>
+
+                <div className="rounded-[28px] border border-white/70 bg-white/75 p-4 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                  <div className="text-xs font-black tracking-widest text-zinc-500">ゴール数値</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {Array.from({ length: 7 }, (_, i) => 20 + i * 5).map((t) => (
+                      <motion.button
+                        key={t}
+                        type="button"
+                        onClick={() => setMenuTarget(t)}
+                        className={[
+                          "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform active:scale-[0.98]",
+                          menuTarget === t
+                            ? "border-white bg-gradient-to-r from-emerald-200 to-cyan-200 text-zinc-800"
+                            : "border-white/70 bg-white/80 text-zinc-700 hover:brightness-105",
+                        ].join(" ")}
+                        aria-pressed={menuTarget === t}
+                        whileHover={{ y: -1 }}
+                        whileTap={{ scale: 0.98, y: 0 }}
+                      >
+                        {t}
+                      </motion.button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-[28px] border border-white/70 bg-white/75 p-4 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                  <div className="text-xs font-black tracking-widest text-zinc-500">先攻/後攻</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {(
+                      [
+                        { id: "p1", label: "自分（P1）" },
+                        { id: "p2", label: "相手（P2）" },
+                        { id: "random", label: "ランダム" },
+                      ] as const
+                    ).map((o) => (
+                      <button
+                        key={o.id}
+                        type="button"
+                        onClick={() => setMenuFirstTurn(o.id)}
+                        className={[
+                          "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform active:scale-[0.98]",
+                          menuFirstTurn === o.id
+                            ? "border-white bg-gradient-to-r from-amber-200 to-fuchsia-200 text-zinc-800"
+                            : "border-white/70 bg-white/80 text-zinc-700 hover:brightness-105",
+                        ].join(" ")}
+                        aria-pressed={menuFirstTurn === o.id}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {menuMode === "cpu" && (
+                  <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs font-black tracking-widest text-zinc-700">難易度</div>
+                      <div className="flex items-center gap-2">
+                        <JellyImage src="/images/easy.png" alt="Easy" ring="rgba(255,220,120,.95)" size={34} />
+                        <JellyImage src="/images/normal.png" alt="Normal" ring="rgba(150,200,255,.95)" size={34} />
+                        <JellyImage src="/images/hard.png" alt="Hard" ring="rgba(210,160,255,.95)" size={34} />
+                        <JellyImage src="/images/god.png" alt="God" ring="rgba(255,170,120,.95)" size={34} />
+                      </div>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      {(
+                        [
+                          { id: "easy", label: "Easy", ring: "rgba(255,220,120,.95)", src: "/images/easy.png" },
+                          { id: "normal", label: "Normal", ring: "rgba(150,200,255,.95)", src: "/images/normal.png" },
+                          { id: "hard", label: "Hard", ring: "rgba(210,160,255,.95)", src: "/images/hard.png" },
+                          { id: "god", label: "God", ring: "rgba(255,170,120,.95)", src: "/images/god.png" },
+                        ] as const
+                      ).map((o) => {
+                        const locked = !unlockedDifficulties.includes(o.id);
+                        return (
+                          <JellySelectButton
+                            key={o.id}
+                            selected={menuDifficulty === o.id}
+                            disabled={locked}
+                            onClick={() => {
+                              if (!locked) setMenuDifficulty(o.id);
+                            }}
+                            label={o.label}
+                            variant="tile"
+                            imgSrc={o.src}
+                            imgAlt={o.label}
+                            ring={o.ring}
+                            imgSize={40}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {menuMode === "online" && (
+                  <div className="rounded-[28px] border border-white/70 bg-white/75 p-4 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                    <div className="text-xs font-black tracking-widest text-zinc-500">オンライン対戦</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setMenuOnlineRole("host")}
+                        className={[
+                          "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)]",
+                          menuOnlineRole === "host"
+                            ? "border-white bg-gradient-to-r from-amber-200 to-pink-200 text-zinc-800"
+                            : "border-white/70 bg-white/80 text-zinc-700",
+                        ].join(" ")}
+                        aria-pressed={menuOnlineRole === "host"}
+                      >
+                        ルーム作成（P1）
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMenuOnlineRole("guest")}
+                        className={[
+                          "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)]",
+                          menuOnlineRole === "guest"
+                            ? "border-white bg-gradient-to-r from-sky-200 to-fuchsia-200 text-zinc-800"
+                            : "border-white/70 bg-white/80 text-zinc-700",
+                        ].join(" ")}
+                        aria-pressed={menuOnlineRole === "guest"}
+                      >
+                        ルーム参加（P2）
+                      </button>
+                    </div>
+                    <div className="mt-3 flex items-center gap-2">
+                      <input
+                        value={menuRoomId}
+                        onChange={(e) => setMenuRoomId(e.target.value)}
+                        placeholder="ルームID（例: abc123）"
+                        className="w-full rounded-2xl border border-white/70 bg-white px-4 py-3 text-sm font-bold text-zinc-800 outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setMenuRoomId(Math.random().toString(36).slice(2, 8))}
+                        className="shrink-0 whitespace-nowrap rounded-2xl border border-white/70 bg-white/85 px-4 py-3 text-sm font-extrabold text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset]"
+                      >
+                        生成
+                      </button>
+                    </div>
+                    <div className="mt-2 text-xs font-semibold text-zinc-500">
+                      同じルームIDで接続すると同期します（ゲストはホストの開始を待ちます）
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={startRandomMatch}
+                  className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  ランダム対戦
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={startGame}
+                  className="flex-1 whitespace-nowrap rounded-[28px] bg-gradient-to-r from-emerald-400 to-cyan-400 px-6 py-4 text-base font-extrabold text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  スタート
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        ) : screen === "matching" ? (
+          <motion.div
+            key="matching"
+            className="w-full"
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+          >
+            <div className="flex flex-col items-center gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+              <div className="text-xs font-black tracking-[0.25em] text-zinc-500">MATCHING</div>
+              <div className="text-3xl font-black tracking-tight text-zinc-900">対戦相手を探しています...</div>
+              <div className="text-sm font-semibold text-zinc-600">最大30秒ほどかかる場合があります</div>
+              <motion.div
+                className="h-3 w-64 overflow-hidden rounded-full border border-white/70 bg-white/80"
+                initial={false}
+              >
+                <motion.div
+                  className="h-full bg-gradient-to-r from-sky-300 to-fuchsia-300"
+                  animate={{ x: ["-40%", "120%"] }}
+                  transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                />
+              </motion.div>
+
+              {matchNotFound && (
+                <div className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.12)]">
+                  見つかりませんでした。
+                </div>
+              )}
+
+              {matchNotFound && (
+                <button
+                  type="button"
+                  onClick={() => void cancelMatchingAndBackToMenu()}
+                  className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  キャンセルしてタイトルへ戻る
+                </button>
+              )}
+            </div>
+          </motion.div>
+        ) : (
+        <motion.div
+          key="play"
+          className="w-full"
+          initial={{ opacity: 0, y: 10, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -10, scale: 0.98 }}
+          transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+        >
+          <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-4 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-6">
+            <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+              <div className="space-y-2">
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
+                <div className="flex flex-wrap items-baseline gap-3">
+                  <div className="text-2xl font-black tracking-tight sm:text-3xl md:text-4xl">{statusText}</div>
+                  {!winner && (
+                    <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                      {movesLeftText}
+                    </div>
+                  )}
+                  {!winner && (
+                    <motion.div
+                      className={[
+                        "rounded-[999px] border px-3 py-1 text-xs font-black shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]",
+                        timeLeftSec <= 10 ? "border-red-300 bg-red-50 text-red-700" : "border-white/70 bg-white/75 text-zinc-700",
+                      ].join(" ")}
+                      animate={timeLeftSec <= 10 ? { x: [0, -2, 2, -2, 2, 0] } : { x: 0 }}
+                      transition={timeLeftSec <= 10 ? { duration: 0.35, repeat: Infinity } : { duration: 0.2 }}
+                    >
+                      {timeLeftSec}s
+                    </motion.div>
+                  )}
+                </div>
+                {!winner && (
+                  <div className="h-3 w-full max-w-sm overflow-hidden rounded-full border border-white/70 bg-white/70">
+                    <motion.div
+                      className={timeLeftSec <= 10 ? "h-full bg-red-400" : "h-full bg-gradient-to-r from-emerald-300 to-cyan-300"}
+                      animate={{ width: `${Math.min(100, Math.max(0, (timeLeftMs / 30000) * 100))}%` }}
+                      transition={{ duration: 0.12, ease: "linear" }}
+                    />
+                  </div>
+                )}
+                <div className="text-sm font-semibold text-zinc-600 md:text-base">
+                  隣接する2マスをタップして合体。合計が{" "}
+                  <span className="inline-flex items-baseline gap-1 rounded-[999px] border border-white/70 bg-white/80 px-3 py-1 font-black text-zinc-900 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                    <span className="text-[10px] font-black tracking-widest text-zinc-600">GOAL</span>
+                    <span className="text-xl font-black tabular-nums">{target}</span>
+                  </span>{" "}
+                  ぴったりで勝利！
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsPaused(true)}
+                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                >
+                  ポーズ
+                </button>
+
+                <button
+                  type="button"
+                  onClick={backToMenu}
+                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                >
+                  モード選択へ
+                </button>
+
+                {!winner && (
+                  <button
+                    type="button"
+                    onClick={endTurnNow}
+                    disabled={!canInteract || movesLeft === TURN_ACTIONS}
+                    className={[
+                      "whitespace-nowrap rounded-3xl border px-5 py-4 text-sm font-black shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform md:px-4 md:py-3",
+                      !canInteract || movesLeft === TURN_ACTIONS
+                        ? "border-white/60 bg-white/55 text-zinc-500 opacity-75"
+                        : "border-white/70 bg-white/85 text-zinc-800 hover:brightness-105 active:scale-[0.98]",
+                    ].join(" ")}
+                  >
+                    ターン終了
+                  </button>
+                )}
+
+                <div className="flex items-center gap-2 rounded-3xl border border-white/70 bg-white/75 px-3 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                  <JellyImage
+                    src={mode === "local" ? "/images/vs_player.png" : mode === "cpu" ? "/images/vs_cpu.png" : "/images/vs_online.png"}
+                    alt="mode"
+                    ring={mode === "local" ? "rgba(255,170,210,.95)" : mode === "cpu" ? "rgba(150,200,255,.95)" : "rgba(160,255,210,.95)"}
+                    size={38}
+                  />
+                  {mode === "cpu" ? (
+                    <JellyImage
+                      src={
+                        cpuDifficulty === "easy"
+                          ? "/images/easy.png"
+                          : cpuDifficulty === "normal"
+                            ? "/images/normal.png"
+                            : cpuDifficulty === "hard"
+                              ? "/images/hard.png"
+                              : "/images/god.png"
+                      }
+                      alt="difficulty"
+                      ring={
+                        cpuDifficulty === "easy"
+                          ? "rgba(255,220,120,.95)"
+                          : cpuDifficulty === "normal"
+                            ? "rgba(150,200,255,.95)"
+                            : cpuDifficulty === "hard"
+                              ? "rgba(210,160,255,.95)"
+                              : "rgba(255,170,120,.95)"
+                      }
+                      size={38}
+                    />
+                  ) : null}
+                  <div className="leading-tight">
+                    <div className="text-[10px] font-black tracking-widest text-zinc-600">MODE</div>
+                    <div className="text-xs font-black text-zinc-800">
+                      {mode === "local" ? "対人" : mode === "cpu" ? `CPU / ${cpuDifficulty.toUpperCase()}` : "オンライン"}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-3xl border border-white/70 bg-white/75 px-4 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                  <div className="flex items-end justify-between gap-3">
+                    <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
+                    <div className="text-[10px] font-black text-zinc-500">自動で補充</div>
+                  </div>
+
+                  <div className="mt-2 flex items-center justify-center gap-2">
+                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white text-2xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
+                      {nextPair.n0}
+                    </div>
+                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white/85 text-xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
+                      {nextPair.n1}
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => reset()}
+                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                >
+                  リセット
+                </button>
+              </div>
+            </header>
+
+            <section className="flex w-full flex-col items-center gap-5">
+              <div className="flex w-full flex-col items-center gap-4">
+                {!winner && (
+                  <div className="w-full max-w-sm">
+                    <div className="relative h-12 rounded-[999px] border border-white/70 bg-white/75 p-1 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_18px_30px_rgba(90,60,160,.12)]">
+                      <motion.div
+                        className={`absolute top-1 h-10 w-[calc(50%-4px)] rounded-[999px] bg-gradient-to-r ${playerAccent(
+                          currentPlayer,
+                        )} shadow-[0_18px_30px_rgba(90,60,160,.22)]`}
+                        animate={{ left: currentPlayer === 1 ? 4 : "calc(50% + 0px)" }}
+                        transition={{ type: "spring", stiffness: 520, damping: 38 }}
+                        aria-hidden="true"
+                      />
+                      <div className="relative grid h-full grid-cols-2 place-items-center text-sm font-black text-white">
+                        <div className="drop-shadow-[0_2px_0_rgba(0,0,0,.15)]">P1</div>
+                        <div className="drop-shadow-[0_2px_0_rgba(0,0,0,.15)]">P2</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="relative touch-none overscroll-contain" ref={boardWrapRef}>
+                  <div className="grid grid-cols-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-3 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-4">
+                    {board.map((value, idx) => {
+                      const isSelected = selected === idx;
+                      const isFlashing = flashIndex === idx;
+                      const isWinningTile = value === targetRef.current;
+                      const isDimmed =
+                        isAnimatingMove && moveOverlay && (idx === moveOverlay.from || idx === moveOverlay.to);
+
+                      return (
+                        <motion.button
+                          key={idx}
+                          type="button"
+                          onClick={() => handleTileClick(idx)}
+                          onTouchStart={(e) => handleTouchStart(idx, e)}
+                          onTouchEnd={(e) => handleTouchEnd(idx, e)}
+                          disabled={!canInteract}
+                          className={[
+                            "relative grid h-28 w-28 select-none place-items-center rounded-3xl border-2 touch-none",
+                            "md:h-36 md:w-36",
+                            "transition-[filter,transform] duration-150 active:scale-[0.98]",
+                            "outline-none focus-visible:ring-4 focus-visible:ring-white/70 focus-visible:ring-offset-0",
+                            canInteract ? "cursor-pointer" : "cursor-default opacity-95",
+                            isSelected ? "ring-4 ring-white/70" : "ring-0",
+                            isFlashing ? "tile-flash" : "",
+                            isWinningTile ? "ring-4 ring-emerald-400/60" : "",
+                            isDimmed ? "opacity-45" : "",
+                          ].join(" ")}
+                          style={tileStyle(value, targetRef.current)}
+                          aria-label={`Tile ${idx + 1}: ${value}`}
+                          ref={(el) => {
+                            tileRefs.current[idx] = el;
+                          }}
+                          animate={bumpIds[idx] ? { scale: [1, 1.09, 0.98, 1] } : { scale: 1 }}
+                          transition={{ type: "tween", duration: 0.26, ease: "easeOut" }}
+                        >
+                          <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
+                          <div className="absolute inset-0 rounded-3xl bg-gradient-to-b from-white/30 to-transparent opacity-70" />
+                          <div className="relative text-5xl font-black tabular-nums tracking-tight text-black/70 md:text-6xl">
+                            <span className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{value}</span>
+                          </div>
+
+                          {isSelected && (
+                            <div className="absolute -bottom-2 left-1/2 h-2.5 w-2.5 -translate-x-1/2 rounded-full bg-white shadow-[0_0_0_8px_rgba(255,255,255,.55)]" />
+                          )}
+                        </motion.button>
+                      );
+                    })}
+                  </div>
+
+                  {!winner && (
+                    <div className="pointer-events-none absolute -inset-8 rounded-[52px] bg-[radial-gradient(circle_at_50%_10%,rgba(255,255,255,.75),transparent_60%)]" />
+                  )}
+
+                  <AnimatePresence>
+                    {moveOverlay && (
+                      <motion.div
+                        key={moveOverlay.id}
+                        className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-2 text-5xl font-black tabular-nums text-black/70"
+                        style={{
+                          background: tileStyle(moveOverlay.value, targetRef.current).background,
+                          borderColor: tileStyle(moveOverlay.value, targetRef.current).borderColor,
+                          boxShadow: tileStyle(moveOverlay.value, targetRef.current).boxShadow,
+                          x: moveOverlay.fromCenter.x - 48,
+                          y: moveOverlay.fromCenter.y - 48,
+                        }}
+                        initial={{ scale: 1, opacity: 1 }}
+                        animate={{
+                          x: moveOverlay.toCenter.x - 48,
+                          y: moveOverlay.toCenter.y - 48,
+                          scale: 0.88,
+                          opacity: 0.98,
+                        }}
+                        exit={{ opacity: 0 }}
+                        transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.75 }}
+                        onAnimationComplete={finishMove}
+                      >
+                        <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
+                        <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.value}</div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {!winner && (
+                  <div className="text-xs font-semibold text-zinc-500">
+                    ヒント: {target} を超えると <span className="font-black text-zinc-700">sum % {target}</span>（ピカッと光る）
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+        </motion.div>
+        )}
+        </AnimatePresence>
+      </div>
+
+      <AnimatePresence>
+      {isPaused && screen === "play" && (
+        <motion.div
+          className="fixed inset-0 z-50"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <div className="absolute inset-0 bg-white/60 backdrop-blur-sm" />
+          <div className="relative mx-auto flex h-full w-full max-w-2xl items-center justify-center px-4">
+            <motion.div
+              className="w-full rounded-[44px] border border-white/70 bg-gradient-to-b from-white/80 to-white/55 p-7 shadow-[0_34px_110px_rgba(120,70,40,.20)] backdrop-blur"
+              initial={{ scale: 0.96, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.98, y: 10 }}
+              transition={{ type: "spring", stiffness: 520, damping: 42 }}
+            >
+              <div className="text-xs font-black tracking-[0.25em] text-zinc-500">PAUSE</div>
+              <div className="mt-2 text-3xl font-black tracking-tight text-zinc-900">一時停止中</div>
+              <div className="mt-3 text-sm font-semibold text-zinc-600">操作はロックされています。</div>
+
+              <div className="mt-6 flex flex-wrap gap-3">
+                <motion.button
+                  type="button"
+                  onClick={() => setIsPaused(false)}
+                  className="rounded-3xl bg-gradient-to-r from-emerald-400 to-cyan-400 px-5 py-4 text-sm font-black text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98] md:py-3"
+                  whileHover={{ y: -1 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  再開
+                </motion.button>
+                <motion.button
+                  type="button"
+                  onClick={() => {
+                    setIsPaused(false);
+                    reset();
+                  }}
+                  className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:py-3"
+                  whileHover={{ y: -1 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  リセット
+                </motion.button>
+                <motion.button
+                  type="button"
+                  onClick={() => {
+                    setIsPaused(false);
+                    backToMenu();
+                  }}
+                  className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:py-3"
+                  whileHover={{ y: -1 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  モード選択へ
+                </motion.button>
+              </div>
+            </motion.div>
+          </div>
+        </motion.div>
+      )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+      {winner && (
+        <motion.div
+          className="fixed inset-0 z-50"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <div className="absolute inset-0 bg-white/60 backdrop-blur-sm" />
+
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            {confetti.map((c) => (
+              <span
+                key={c.id}
+                className="confetti-piece"
+                style={{
+                  left: c.left,
+                  width: `${c.sizePx}px`,
+                  height: `${Math.max(10, c.sizePx * 2)}px`,
+                  background: `hsl(${c.hue} 90% 60%)`,
+                  animationDelay: `${c.delayMs}ms`,
+                  animationDuration: `${c.durationMs}ms`,
+                  transform: `translateY(-20px) rotate(${c.rotateDeg}deg)`,
+                }}
+              />
+            ))}
+          </div>
+
+          <div className="relative mx-auto flex h-full w-full max-w-2xl items-center justify-center px-4">
+            {showGodVictory && mode === "cpu" && cpuDifficulty === "god" && winner === 1 ? (
+              <motion.div
+                className="w-full rounded-[44px] border-2 border-yellow-300/80 bg-gradient-to-b from-white/85 to-white/60 p-7 shadow-[0_0_20px_goldenrod,0_34px_120px_rgba(120,70,40,.22)] backdrop-blur"
+                initial={{ scale: 0.92, y: 14, rotate: -1, opacity: 0 }}
+                animate={{ scale: 1, y: 0, rotate: 0, opacity: 1 }}
+                exit={{ scale: 0.98, y: 10, opacity: 0 }}
+                transition={{ type: "spring", stiffness: 520, damping: 22 }}
+              >
+                <div className="text-xs font-black tracking-[0.25em] text-amber-700/90">GOD SLAYER</div>
+                <div className="mt-2 text-4xl font-black tracking-tight text-zinc-900">
+                  神を超えし者、現る！
+                </div>
+                <div className="mt-4 flex flex-col items-center gap-3">
+                  <motion.img
+                    src="/images/god.png"
+                    alt="エンゼル・クラウド"
+                    className="select-none"
+                    style={{ width: 160, height: 160, objectFit: "contain" }}
+                    initial={{ scale: 0.9, y: 8, rotate: 2 }}
+                    animate={{ scale: [0.95, 1.02, 1], y: [6, -2, 0], rotate: [2, -2, 0] }}
+                    transition={{ type: "tween", duration: 0.6, ease: "easeInOut" }}
+                    draggable={false}
+                  />
+                  <div className="text-center text-sm font-black text-zinc-800">
+                    まさか、この私が負けるとは...！！あなたこそが真の『ぷるぷらす』マスターです！
+                  </div>
+                </div>
+
+                <div className="mt-6 flex flex-wrap justify-center gap-3">
+                  <motion.button
+                    type="button"
+                    onClick={backToMenu}
+                    className="rounded-3xl bg-gradient-to-r from-amber-400 to-yellow-300 px-6 py-3 text-sm font-black text-zinc-900 shadow-[0_18px_30px_rgba(120,70,40,.22)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                    whileHover={{ y: -1 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    モード選択へ戻る
+                  </motion.button>
+                </div>
+              </motion.div>
+            ) : (
+              <motion.div
+                className="w-full rounded-[44px] border border-white/70 bg-gradient-to-b from-white/80 to-white/55 p-7 shadow-[0_34px_110px_rgba(120,70,40,.20)] backdrop-blur"
+                initial={{ scale: 0.96, y: 10 }}
+                animate={{ scale: 1, y: 0 }}
+                exit={{ scale: 0.98, y: 10 }}
+                transition={{ type: "spring", stiffness: 520, damping: 42 }}
+              >
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">VICTORY</div>
+                <div className="mt-2 text-4xl font-black tracking-tight text-zinc-900">
+                  <span className={`bg-gradient-to-r ${playerAccent(winner)} bg-clip-text text-transparent`}>
+                    {playerLabel(winner)}
+                  </span>{" "}
+                  の勝利！
+                </div>
+                {victoryPraise ? (
+                  <div className="mt-2 inline-flex w-fit items-center gap-2 rounded-[999px] border border-white/70 bg-white/80 px-4 py-2 text-sm font-black text-zinc-800 shadow-[0_18px_34px_rgba(90,60,160,.14)]">
+                    {victoryPraise}
+                  </div>
+                ) : null}
+                <div className="mt-3 text-sm font-semibold text-zinc-600">
+                  どこかのマスが「ぴったり{target}」になりました。
+                </div>
+                {unlockMessage && (
+                  <div className="mt-4 inline-flex items-center gap-2 rounded-[999px] border border-white/70 bg-white/80 px-4 py-2 text-sm font-black text-zinc-800 shadow-[0_18px_34px_rgba(90,60,160,.14)]">
+                    <Icon name="lock" className="h-5 w-5" />
+                    {unlockMessage}
+                  </div>
+                )}
+
+                <div className="mt-6 flex flex-wrap gap-3">
+                  <motion.button
+                    type="button"
+                    onClick={backToMenu}
+                    className="rounded-3xl bg-gradient-to-r from-emerald-400 to-cyan-400 px-5 py-3 text-sm font-black text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                    whileHover={{ y: -1 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    モード選択へ戻る
+                  </motion.button>
+                </div>
+              </motion.div>
+            )}
+          </div>
+        </motion.div>
+      )}
+      </AnimatePresence>
+
+      <style jsx global>{`
+        @keyframes tileFlash {
+          0% {
+            box-shadow: 0 0 0 0 rgba(249, 115, 22, 0), 0 18px 0 rgba(255, 255, 255, 0.42) inset,
+              0 18px 40px rgba(80, 60, 130, 0.18), 0 2px 0 rgba(40, 30, 70, 0.16);
+            filter: saturate(1) brightness(1);
+          }
+          25% {
+            box-shadow: 0 0 0 10px rgba(249, 115, 22, 0.24), 0 18px 0 rgba(255, 255, 255, 0.48) inset,
+              0 18px 40px rgba(80, 60, 130, 0.18), 0 2px 0 rgba(40, 30, 70, 0.16);
+            filter: saturate(1.35) brightness(1.07);
+          }
+          100% {
+            box-shadow: 0 0 0 0 rgba(249, 115, 22, 0), 0 18px 0 rgba(255, 255, 255, 0.42) inset,
+              0 18px 40px rgba(80, 60, 130, 0.18), 0 2px 0 rgba(40, 30, 70, 0.16);
+            filter: saturate(1) brightness(1);
+          }
+        }
+        .tile-flash {
+          animation: tileFlash 420ms ease-out;
+        }
+
+        @keyframes confettiFall {
+          0% {
+            top: -10%;
+            opacity: 0;
+          }
+          8% {
+            opacity: 1;
+          }
+          100% {
+            top: 110%;
+            opacity: 1;
+          }
+        }
+        @keyframes confettiWiggle {
+          0% {
+            transform: translateY(-20px) rotate(0deg);
+          }
+          100% {
+            transform: translateY(0) rotate(720deg);
+          }
+        }
+        .confetti-piece {
+          position: absolute;
+          top: -10%;
+          border-radius: 999px;
+          filter: drop-shadow(0 12px 18px rgba(90, 60, 160, 0.22));
+          animation-name: confettiFall, confettiWiggle;
+          animation-timing-function: ease-in, linear;
+          animation-iteration-count: 1, 1;
+          animation-fill-mode: forwards, forwards;
+        }
+      `}</style>
+    </main>
+  );
+}
+

@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+:root {
+  --background: #fff8e7;
+  --foreground: #1a1a1a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), ui-rounded, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
