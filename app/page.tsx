@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
 import confettiBurst from "canvas-confetti";
+import { getCpuMovePlan } from "../engine/ai";
 
 type Player = 1 | 2;
 type Winner = Player | null;
@@ -11,7 +12,8 @@ type GameMode = "cpu" | "local" | "online";
 type CpuDifficulty = "easy" | "normal" | "hard" | "god";
 type TargetValue = number;
 type FirstTurn = "p1" | "p2" | "random";
-type Screen = "menu" | "matching" | "play";
+type Screen = "title" | "menu" | "settings" | "matching" | "play";
+type TimeLimitChoice = "15" | "30" | "none";
 
 type OnlineRole = "host" | "guest";
 type OnlineState = {
@@ -54,6 +56,10 @@ const BOARD_SIZE = 2;
 const TILE_COUNT = BOARD_SIZE * BOARD_SIZE;
 const DEFAULT_TARGET: TargetValue = 25;
 const TURN_ACTIONS = 3;
+const SE_GAINS: Record<string, number> = {
+  // make.mp3がwin.mp3より小さく聞こえるため、ゲインを少し上げる
+  make: 1.35,
+};
 
 function randInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -181,11 +187,14 @@ function makeConfetti(count: number): ConfettiPiece[] {
 
 type MoveOverlay = {
   id: string;
-  value: number;
   from: number;
   to: number;
   fromCenter: { x: number; y: number };
   toCenter: { x: number; y: number };
+  fusionCenter: { x: number; y: number };
+  fromValue: number;
+  toValueBefore: number;
+  toValueAfter: number;
 };
 
 type PlannedMove = {
@@ -427,9 +436,10 @@ function JellySelectButton({
 }
 
 export default function Page() {
-  const [screen, setScreen] = useState<Screen>("menu");
+  const [screen, setScreen] = useState<Screen>("title");
   const [isPaused, setIsPaused] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const matchingRunIdRef = useRef(0);
 
   const [unlockedDifficulties, setUnlockedDifficulties] = useState<CpuDifficulty[]>(["easy", "normal"]);
   const [unlockMessage, setUnlockMessage] = useState<string | null>(null);
@@ -443,10 +453,14 @@ export default function Page() {
   const [menuTarget, setMenuTarget] = useState<TargetValue>(DEFAULT_TARGET);
   const [menuFirstTurn, setMenuFirstTurn] = useState<FirstTurn>("random");
   const [menuDifficulty, setMenuDifficulty] = useState<CpuDifficulty>("normal");
+  const [menuTimeLimit, setMenuTimeLimit] = useState<TimeLimitChoice>("30");
   const [menuRoomId, setMenuRoomId] = useState<string>("");
   const [menuOnlineRole, setMenuOnlineRole] = useState<OnlineRole>("host");
   const [matchId, setMatchId] = useState<number | null>(null);
   const [matchNotFound, setMatchNotFound] = useState(false);
+
+  const [bgmVolume, setBgmVolume] = useState<number>(70);
+  const [seVolume, setSeVolume] = useState<number>(70);
 
   // Active game settings
   const [target, setTarget] = useState<number>(DEFAULT_TARGET);
@@ -460,6 +474,7 @@ export default function Page() {
   const [mode, setMode] = useState<GameMode>("cpu");
   const [cpuDifficulty, setCpuDifficulty] = useState<CpuDifficulty>("normal");
   const [online, setOnline] = useState<OnlineState | null>(null);
+  const [timeLimitMs, setTimeLimitMs] = useState<number | null>(30_000);
   const [actionDeadlineMs, setActionDeadlineMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [selected, setSelected] = useState<number | null>(null);
@@ -487,11 +502,18 @@ export default function Page() {
   const cpuDifficultyRef = useRef<CpuDifficulty>(cpuDifficulty);
   const targetRef = useRef<number>(target);
   const winnerRef = useRef<Winner>(winner);
+  const timeLimitMsRef = useRef<number | null>(timeLimitMs);
   const cpuTimeoutRef = useRef<number | null>(null);
   const cpuPlannedLineRef = useRef<PlannedMove[] | null>(null);
   const onlineChannelRef = useRef<RealtimeChannel | null>(null);
   const matchChannelRef = useRef<RealtimeChannel | null>(null);
   const matchIdRef = useRef<number | null>(matchId);
+  const isProcessingRef = useRef<boolean>(isProcessing);
+
+  // Audio management
+  const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const seAudioCacheRef = useRef<Record<string, HTMLAudioElement>>({});
+  const bgmTriedRef = useRef(false);
 
   useEffect(() => {
     boardRef.current = board;
@@ -517,6 +539,116 @@ export default function Page() {
   useEffect(() => {
     cpuDifficultyRef.current = cpuDifficulty;
   }, [cpuDifficulty]);
+  useEffect(() => {
+    timeLimitMsRef.current = timeLimitMs;
+  }, [timeLimitMs]);
+
+  useEffect(() => {
+    // Restore saved volumes
+    try {
+      const bgmRaw = localStorage.getItem("plusBattleBgmVolume");
+      const seRaw = localStorage.getItem("plusBattleSeVolume");
+      const bgm = bgmRaw ? Number(bgmRaw) : null;
+      const se = seRaw ? Number(seRaw) : null;
+      if (bgm !== null && Number.isFinite(bgm)) setBgmVolume(Math.max(0, Math.min(100, bgm)));
+      if (se !== null && Number.isFinite(se)) setSeVolume(Math.max(0, Math.min(100, se)));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("plusBattleBgmVolume", String(bgmVolume));
+      localStorage.setItem("plusBattleSeVolume", String(seVolume));
+    } catch {
+      // ignore
+    }
+  }, [bgmVolume, seVolume]);
+
+  useEffect(() => {
+    // Init BGM + SE assets once
+    const bgm = new Audio("/music/bgm.mp3");
+    bgm.loop = true;
+    bgm.preload = "auto";
+    bgm.volume = bgmVolume / 100;
+    bgmAudioRef.current = bgm;
+
+    // Pre-cache SE audio objects
+    const seFiles: Array<[string, string]> = [
+      ["sentaku", "/sounds/sentaku.mp3"],
+      ["susumu", "/sounds/susumu.mp3"],
+      ["modoru", "/sounds/modoru.mp3"],
+      ["yuugou1", "/sounds/yuugou1.mp3"],
+      ["yuugou2", "/sounds/yuugou2.mp3"],
+      ["make", "/sounds/make.mp3"],
+      ["win", "/sounds/win.mp3"],
+      ["godwin", "/sounds/godwin.mp3"],
+    ];
+    seFiles.forEach(([k, url]) => {
+      const a = new Audio(url);
+      a.preload = "auto";
+      const gain = SE_GAINS[k] ?? 1;
+      a.volume = Math.min(1, (seVolume / 100) * gain);
+      seAudioCacheRef.current[k] = a;
+    });
+    // Try to start BGM immediately (may be blocked by browser, so it's safe to ignore)
+    return () => {
+      bgmAudioRef.current?.pause();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (bgmAudioRef.current) bgmAudioRef.current.volume = bgmVolume / 100;
+    Object.entries(seAudioCacheRef.current).forEach(([k, a]) => {
+      const gain = SE_GAINS[k] ?? 1;
+      a.volume = Math.min(1, (seVolume / 100) * gain);
+    });
+  }, [bgmVolume, seVolume]);
+
+  async function startBgm() {
+    if (!bgmAudioRef.current) return;
+    try {
+      const audio = bgmAudioRef.current;
+      // If BGM already started, do not seek to 0 (avoid restart bug).
+      if (!bgmTriedRef.current || audio.currentTime === 0) {
+        audio.currentTime = 0;
+      }
+      bgmTriedRef.current = true;
+      await bgmAudioRef.current.play();
+    } catch {
+      // ignore
+    }
+  }
+
+  function playSe(
+    key: "sentaku" | "susumu" | "modoru" | "yuugou1" | "yuugou2" | "make" | "win" | "godwin",
+  ) {
+    const a = seAudioCacheRef.current[key];
+    if (!a) return;
+    try {
+      a.currentTime = 0;
+      void a.play().catch(() => {
+        // ignore
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  function playRandomYuugou() {
+    const pick = Math.random() < 0.5 ? "yuugou1" : "yuugou2";
+    playSe(pick);
+  }
+
+  useEffect(() => {
+    // Best-effort: browsers may block autoplay, so it's safe to ignore failures.
+    void startBgm();
+  }, []);
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
 
   useEffect(() => {
     try {
@@ -596,13 +728,39 @@ export default function Page() {
     return `のこり手数：${movesLeft}`;
   }, [movesLeft, winner]);
 
-  const timeLeftMs = useMemo(() => {
+  const timeLeftMs = useMemo<number | null>(() => {
     if (screen !== "play" || isPaused || winner) return 0;
-    if (!actionDeadlineMs) return 0;
+    if (actionDeadlineMs === null) return null;
     return Math.max(0, actionDeadlineMs - nowMs);
   }, [actionDeadlineMs, isPaused, nowMs, screen, winner]);
 
-  const timeLeftSec = useMemo(() => Math.ceil(timeLeftMs / 1000), [timeLeftMs]);
+  const timeLeftSec = useMemo(() => (timeLeftMs === null ? null : Math.ceil(timeLeftMs / 1000)), [timeLeftMs]);
+
+  function choiceToMs(choice: TimeLimitChoice): number | null {
+    if (choice === "15") return 15_000;
+    if (choice === "30") return 30_000;
+    return null;
+  }
+
+  const mergeAnim = useMemo(() => {
+    if (!moveOverlay) return null;
+    const tileHalf = 48; // h-24 w-24
+    const fromTL = { x: moveOverlay.fromCenter.x - tileHalf, y: moveOverlay.fromCenter.y - tileHalf };
+    const toTL = { x: moveOverlay.toCenter.x - tileHalf, y: moveOverlay.toCenter.y - tileHalf };
+    const fusionTL = { x: moveOverlay.fusionCenter.x - tileHalf, y: moveOverlay.fusionCenter.y - tileHalf };
+
+    const dx = moveOverlay.toCenter.x - moveOverlay.fromCenter.x;
+    const dy = moveOverlay.toCenter.y - moveOverlay.fromCenter.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    const ux = dx / len;
+    const uy = dy / len;
+
+    const prePushPx = 7;
+    const wobblePx = 6;
+    const rotateDeg = Math.max(-10, Math.min(10, ux * 10));
+
+    return { fromTL, toTL, fusionTL, ux, uy, prePushPx, wobblePx, rotateDeg };
+  }, [moveOverlay]);
 
   function getClientId() {
     if (typeof window === "undefined") return "server";
@@ -641,6 +799,8 @@ export default function Page() {
   }
 
   async function cancelMatchingAndBackToMenu() {
+    matchingRunIdRef.current += 1; // cancel any in-flight matching loop
+    playSe("modoru");
     await cleanupMatchRecord();
     await leaveMatchChannel();
     await leaveOnlineRoom();
@@ -663,18 +823,24 @@ export default function Page() {
   }
 
   async function startRandomMatch() {
+    playSe("susumu");
+    const runId = matchingRunIdRef.current + 1;
+    matchingRunIdRef.current = runId;
+    setTimeLimitMs(30_000); // random match is always 30s
     setScreen("matching");
     setMatchNotFound(false);
     setMatchId(null);
 
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
+      if (matchingRunIdRef.current !== runId) return;
       const { data: waiting } = await supabase
         .from("public_matches")
         .select("id,room_id,status")
         .eq("status", "waiting")
         .limit(1)
         .maybeSingle<PublicMatchRow>();
+      if (matchingRunIdRef.current !== runId) return;
 
       if (waiting) {
         const { data: claimed } = await supabase
@@ -684,6 +850,7 @@ export default function Page() {
           .eq("status", "waiting")
           .select("id,room_id,status")
           .maybeSingle<PublicMatchRow>();
+        if (matchingRunIdRef.current !== runId) return;
 
         if (claimed && claimed.status === "playing") {
           // We are guest (P2)
@@ -692,6 +859,7 @@ export default function Page() {
           setMenuRoomId(claimed.room_id);
           setMatchId(claimed.id);
           await joinOnlineRoom(claimed.room_id, "guest");
+          if (matchingRunIdRef.current !== runId) return;
           setScreen("play");
           return;
         }
@@ -706,6 +874,7 @@ export default function Page() {
         .insert({ room_id: roomId, status: "waiting" })
         .select("id,room_id,status")
         .maybeSingle<PublicMatchRow>();
+      if (matchingRunIdRef.current !== runId) return;
 
       if (!created) continue;
 
@@ -716,16 +885,23 @@ export default function Page() {
 
       // Listen for status -> playing
       await leaveMatchChannel();
+      if (matchingRunIdRef.current !== runId) {
+        // best-effort: avoid leaving a waiting record behind
+        await cleanupMatchRecord();
+        return;
+      }
       const mc = supabase
         .channel(`plus-battle-match-${created.id}`)
         .on(
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "public_matches", filter: `id=eq.${created.id}` },
           async (payload) => {
+            if (matchingRunIdRef.current !== runId) return;
             const row = payload.new as PublicMatchRow;
             if (row.status !== "playing") return;
             // Start online as host and broadcast initial state.
             await joinOnlineRoom(row.room_id, "host");
+            if (matchingRunIdRef.current !== runId) return;
 
             const appliedTarget = menuTarget;
             setTarget(appliedTarget);
@@ -773,10 +949,12 @@ export default function Page() {
 
       // Join room channel early (optional but helps)
       await joinOnlineRoom(created.room_id, "host");
+      if (matchingRunIdRef.current !== runId) return;
       return;
     }
 
     // timeout -> show "not found" and wait for user action
+    if (matchingRunIdRef.current !== runId) return;
     setMatchNotFound(true);
   }
 
@@ -801,7 +979,7 @@ export default function Page() {
       setCurrentPlayer(data.currentPlayer);
       setMovesLeft(data.movesLeft);
       setWinner(data.winner);
-      if (typeof data.actionDeadlineMs === "number") setActionDeadlineMs(data.actionDeadlineMs);
+      if ("actionDeadlineMs" in data) setActionDeadlineMs(typeof data.actionDeadlineMs === "number" ? data.actionDeadlineMs : null);
       setFlashIndex(null);
       setSelected(null);
       setIsAnimatingMove(false);
@@ -851,6 +1029,7 @@ export default function Page() {
   }
 
   function startGame() {
+    playSe("susumu");
     setUnlockMessage(null);
     setShowGodVictory(false);
     setPendingWinner(null);
@@ -862,10 +1041,12 @@ export default function Page() {
     const appliedDifficulty = menuDifficulty;
     const first: Player =
       menuFirstTurn === "random" ? (Math.random() < 0.5 ? 1 : 2) : menuFirstTurn === "p1" ? 1 : 2;
+    const appliedLimit = choiceToMs(menuTimeLimit);
 
     if (appliedMode === "online") {
       const roomId = (menuRoomId || "").trim();
       if (!roomId) return;
+      setTimeLimitMs(appliedLimit);
       void joinOnlineRoom(roomId, menuOnlineRole).then(() => {
         setTarget(appliedTarget);
         setMode("online");
@@ -890,6 +1071,8 @@ export default function Page() {
           setNextQueue(q);
           setNextIndex(0);
           setNextNumber(q[0]!);
+          const deadline = appliedLimit === null ? null : Date.now() + appliedLimit;
+          setActionDeadlineMs(deadline);
           void broadcastOnlineState({
             target: appliedTarget,
             board: rolled.board,
@@ -900,6 +1083,7 @@ export default function Page() {
             movesLeft: TURN_ACTIONS,
             winner: null,
             startingPlayer: 1,
+            actionDeadlineMs: deadline,
           });
         } else {
           // guest waits for host state
@@ -908,11 +1092,13 @@ export default function Page() {
           setNextQueue(q);
           setNextIndex(0);
           setNextNumber(q[0]!);
+          setActionDeadlineMs(null);
         }
       });
       return;
     }
 
+    setTimeLimitMs(appliedLimit);
     setTarget(appliedTarget);
     setMode(appliedMode);
     setCpuDifficulty(appliedDifficulty);
@@ -936,12 +1122,13 @@ export default function Page() {
     setScreen("play");
 
     // start action timer for local/cpu
-    setActionDeadlineMs(Date.now() + 30_000);
+    setActionDeadlineMs(appliedLimit === null ? null : Date.now() + appliedLimit);
   }
 
   function backToMenu() {
     if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
     if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    playSe("modoru");
     setIsPaused(false);
     setUnlockMessage(null);
     setShowGodVictory(false);
@@ -983,10 +1170,16 @@ export default function Page() {
     setIsAnimatingMove(false);
     completedOverlayIdRef.current = null;
     setBumpIds(Array.from({ length: TILE_COUNT }, () => 0));
-    setActionDeadlineMs(Date.now() + 30_000);
+    {
+      const limit = timeLimitMsRef.current;
+      setActionDeadlineMs(limit === null ? null : Date.now() + limit);
+    }
     cpuPlannedLineRef.current = null;
 
     if (nextMode === "online" && online) {
+      const limit = timeLimitMsRef.current;
+      const deadline = limit === null ? null : Date.now() + limit;
+      setActionDeadlineMs(deadline);
       void broadcastOnlineState({
         target: targetRef.current,
         board: rolled.board,
@@ -997,7 +1190,7 @@ export default function Page() {
         movesLeft: TURN_ACTIONS,
         winner: null,
         startingPlayer,
-        actionDeadlineMs: Date.now() + 30_000,
+        actionDeadlineMs: deadline,
       });
     }
   }
@@ -1065,6 +1258,17 @@ export default function Page() {
     }
   }, [winner]);
 
+  useEffect(() => {
+    if (!winner) return;
+    // 相手（CPU側）が勝った場合は make.mp3
+    if (modeRef.current === "cpu" && winner === 2) {
+      playSe("make");
+      return;
+    }
+    const isGod = modeRef.current === "cpu" && cpuDifficultyRef.current === "god" && winner === 1;
+    playSe(isGod ? "godwin" : "win");
+  }, [winner]);
+
   function bumpForChanges(prev: number[], next: number[]) {
     setBumpIds((ids) => ids.map((id, i) => (prev[i] === next[i] ? id : id + 1)));
   }
@@ -1088,7 +1292,8 @@ export default function Page() {
     setMovesLeft(TURN_ACTIONS);
     setCurrentPlayer((p) => (p === 1 ? 2 : 1));
 
-    const newDeadline = Date.now() + 30_000;
+    const limit = timeLimitMsRef.current;
+    const newDeadline = limit === null ? null : Date.now() + limit;
     setActionDeadlineMs(newDeadline);
 
     if (modeRef.current === "online" && online && online.player === currentPlayerRef.current) {
@@ -1144,7 +1349,8 @@ export default function Page() {
     if (movesLeftRef.current - 1 <= 0) cpuPlannedLineRef.current = null;
 
     // Reset action timer after a move completes
-    const newDeadline = Date.now() + 30_000;
+    const limit = timeLimitMsRef.current;
+    const newDeadline = limit === null ? null : Date.now() + limit;
     setActionDeadlineMs(newDeadline);
 
     // Online sync (authoritative by active player)
@@ -1181,22 +1387,42 @@ export default function Page() {
     const fromCenter = fromEl ? centerInBoard(fromEl) : null;
     const toCenter = toEl ? centerInBoard(toEl) : null;
 
+    isProcessingRef.current = true;
     setIsProcessing(true);
     if (prefersReducedMotion || !fromCenter || !toCenter) {
+      playRandomYuugou();
       applyMove(from, to);
-      window.setTimeout(() => setIsProcessing(false), 0);
+      window.setTimeout(() => {
+        setIsProcessing(false);
+        isProcessingRef.current = false;
+      }, 0);
       return;
     }
 
     setIsAnimatingMove(true);
     completedOverlayIdRef.current = null;
+    // Merge SE should happen at the moment the animation starts.
+    playRandomYuugou();
+
+    const fromValue = boardRef.current[from]!;
+    const toValueBefore = boardRef.current[to]!;
+    const sum = toValueBefore + fromValue;
+    const t = targetRef.current;
+    const toValueAfter = sum === t ? t : sum > t ? sum % t : sum;
+    const fusionCenter = {
+      x: (fromCenter.x + toCenter.x) / 2,
+      y: (fromCenter.y + toCenter.y) / 2,
+    };
     setMoveOverlay({
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      value: boardRef.current[from],
       from,
       to,
       fromCenter,
       toCenter,
+      fusionCenter,
+      fromValue,
+      toValueBefore,
+      toValueAfter,
     });
   }
 
@@ -1211,6 +1437,7 @@ export default function Page() {
 
   function handleTouchStart(idx: number, e: React.TouchEvent) {
     if (!canInteract) return;
+    if (isProcessingRef.current || isAnimatingMove || moveOverlay) return;
     const t = e.touches[0];
     if (!t) return;
     touchStartRef.current = { idx, x: t.clientX, y: t.clientY };
@@ -1254,112 +1481,7 @@ export default function Page() {
     return moves;
   }
 
-  function applyMoveToBoard(b: number[], from: number, to: number, refillValue: number) {
-    const next = [...b];
-    const sum = b[to] + b[from];
-    const t = targetRef.current;
-    const computedToValue = sum === t ? t : sum > t ? sum % t : sum;
-    next[to] = computedToValue;
-    next[from] = refillValue;
-    return { next, sum };
-  }
-
-  function opponentHasImmediateWin(b: number[]) {
-    const t = targetRef.current;
-    return listAllMoves(b).some((m) => m.sum === t);
-  }
-
-  function evaluateBoardForCpu(b: number[]) {
-    // Prefer consolidating larger numbers into the "bottom-right" (index 3) to feel like a center pile.
-    const t = targetRef.current;
-    const weights = [1.0, 1.2, 1.2, 1.5];
-    const weighted = b.reduce((acc, v, i) => acc + v * weights[i]!, 0);
-    const closeness = Math.max(...b.map((v) => -Math.abs(t - v)));
-    const adjPairs: Array<[number, number]> = [
-      [0, 1],
-      [0, 2],
-      [1, 3],
-      [2, 3],
-    ];
-    const adjBonus = adjPairs.reduce((acc, [a, c]) => {
-      const va = b[a]!;
-      const vb = b[c]!;
-      const bigPair = Math.min(va, vb); // reward having two big numbers adjacent
-      const near = -Math.abs(t - (va + vb)); // reward adjacency that could combine toward target
-      return acc + bigPair * 1.4 + near * 0.25;
-    }, 0);
-    const scale = Math.max(1, t / 25); // larger goals emphasize long-game structure
-    return weighted * 2 + closeness * 1.5 + adjBonus * 0.12 * scale;
-  }
-
-  function findWinningLineExact(bStart: number[], idx: number, k: number): PlannedMove | null {
-    const q = nextQueueRef.current;
-    const t = targetRef.current;
-    function nextAt(i: number) {
-      const v = q[i];
-      return typeof v === "number" ? v : randInt(1, 9);
-    }
-    function rec(b: number[], i: number, left: number, first: PlannedMove | null): PlannedMove | null {
-      if (left <= 0) return null;
-      const moves = listAllMoves(b);
-      const refill = nextAt(i);
-      for (const m of moves) {
-        const { next: b2, sum } = applyMoveToBoard(b, m.from, m.to, refill);
-        const f = first ?? { from: m.from, to: m.to };
-        if (sum === t) return f;
-        const r = rec(b2, i + 1, left - 1, f);
-        if (r) return r;
-      }
-      return null;
-    }
-    return rec(bStart, idx, k, null);
-  }
-
-  function opponentCanWinIn2ExactFromQueue(bStart: number[], idx: number) {
-    const q = nextQueueRef.current;
-    const t = targetRef.current;
-    const n0 = q[idx] ?? randInt(1, 9);
-    const n1 = q[idx + 1] ?? randInt(1, 9);
-    const moves1 = listAllMoves(bStart);
-    for (const m1 of moves1) {
-      const { next: b1, sum: s1 } = applyMoveToBoard(bStart, m1.from, m1.to, n0);
-      if (s1 === t) return true;
-      const moves2 = listAllMoves(b1);
-      for (const m2 of moves2) {
-        const { sum: s2 } = applyMoveToBoard(b1, m2.from, m2.to, n1);
-        if (s2 === t) return true;
-      }
-    }
-    return false;
-  }
-
-  function opponentCanWinIn3MovesExact(bStart: number[], idx: number) {
-    const q = nextQueueRef.current;
-    const t = targetRef.current;
-    function nextAt(i: number) {
-      const v = q[i];
-      return typeof v === "number" ? v : randInt(1, 9);
-    }
-    const moves0 = listAllMoves(bStart);
-    const r0 = nextAt(idx);
-    for (const m0 of moves0) {
-      const { next: b1, sum: s1 } = applyMoveToBoard(bStart, m0.from, m0.to, r0);
-      if (s1 === t) return true;
-      const moves1 = listAllMoves(b1);
-      const r1 = nextAt(idx + 1);
-      for (const m1 of moves1) {
-        const { next: b2, sum: s2 } = applyMoveToBoard(b1, m1.from, m1.to, r1);
-        if (s2 === t) return true;
-        const moves2 = listAllMoves(b2);
-        const r2 = nextAt(idx + 2);
-        for (const m2 of moves2) {
-          const { sum: s3 } = applyMoveToBoard(b2, m2.from, m2.to, r2);
-          if (s3 === t) return true;
-        }
-      }
-    }
-    return false;
-  }
+  // CPU AI planning is delegated to `engine/ai.ts`.
 
   function planCpuMove(): PlannedMove | null {
     const existing = cpuPlannedLineRef.current;
@@ -1367,87 +1489,19 @@ export default function Page() {
       return existing.shift() ?? null;
     }
 
-    const b0 = boardRef.current;
-    const idx0 = nextIndexRef.current;
-    const t = targetRef.current;
-    const d = cpuDifficultyRef.current;
-    const remaining = Math.min(TURN_ACTIONS, Math.max(1, movesLeftRef.current));
+    const plan = getCpuMovePlan({
+      board: boardRef.current,
+      target: targetRef.current,
+      nextQueue: nextQueueRef.current,
+      nextIndex: nextIndexRef.current,
+      movesLeft: movesLeftRef.current,
+      difficulty: cpuDifficultyRef.current,
+      rng: Math.random,
+    });
 
-    const moves0 = listAllMoves(b0);
-    if (moves0.length === 0) return null;
+    if (!plan?.line?.length) return null;
 
-    type Line = { moves: PlannedMove[]; leaf: number[]; leafIdx: number; winAt: number | null };
-
-    function nextAt(i: number) {
-      const v = nextQueueRef.current[i];
-      return typeof v === "number" ? v : randInt(1, 9);
-    }
-
-    function enumerateLines(b: number[], idx: number, depth: number, prefix: PlannedMove[] = []): Line[] {
-      if (depth <= 0) return [{ moves: prefix, leaf: b, leafIdx: idx, winAt: null }];
-      const moves = listAllMoves(b);
-      if (moves.length === 0) return [{ moves: prefix, leaf: b, leafIdx: idx, winAt: null }];
-      const refill = nextAt(idx);
-      const out: Line[] = [];
-      for (const m of moves) {
-        const { next: b2, sum } = applyMoveToBoard(b, m.from, m.to, refill);
-        const nextPrefix = [...prefix, { from: m.from, to: m.to }];
-        if (sum === t) {
-          out.push({ moves: nextPrefix, leaf: b2, leafIdx: idx + 1, winAt: nextPrefix.length });
-          continue;
-        }
-        out.push(...enumerateLines(b2, idx + 1, depth - 1, nextPrefix));
-      }
-      return out;
-    }
-
-    function pickLineByRules(): PlannedMove[] {
-      // OFFENSE priority per difficulty
-      if (d === "normal") {
-        const win = findWinningLineExact(b0, idx0, Math.min(2, remaining));
-        if (win) return [win];
-      } else {
-        const win = findWinningLineExact(b0, idx0, remaining);
-        if (win) return [win];
-      }
-
-      if (d === "easy") {
-        const refill0 = nextAt(idx0);
-        const candidates = moves0.map((m) => {
-          const { next: b1 } = applyMoveToBoard(b0, m.from, m.to, refill0);
-          return { first: { from: m.from, to: m.to }, forbidden: opponentHasImmediateWin(b1) };
-        });
-        const safe = candidates.filter((c) => !c.forbidden);
-        const pick = (safe.length ? safe : candidates)[Math.floor(Math.random() * (safe.length ? safe.length : candidates.length))]!;
-        return [pick.first];
-      }
-
-      const lines = enumerateLines(b0, idx0, remaining);
-
-      const scored = lines.map((ln) => {
-        const hasImmediate = opponentHasImmediateWin(ln.leaf);
-        const hardThreat = d === "hard" ? opponentCanWinIn2ExactFromQueue(ln.leaf, ln.leafIdx) : false;
-        const godThreat = d === "god" ? opponentCanWinIn3MovesExact(ln.leaf, ln.leafIdx) : false;
-        const safe =
-          d === "normal"
-            ? !hasImmediate
-            : d === "hard"
-              ? !hasImmediate && !hardThreat
-              : !hasImmediate && !godThreat;
-        const winScore = ln.winAt ? 1e12 - ln.winAt * 1e8 : 0;
-        const score = winScore + (safe ? 1e9 : 0) + evaluateBoardForCpu(ln.leaf) + Math.random() * 0.02;
-        return { ln, safe, score };
-      });
-
-      const safeLines = scored.filter((s) => s.safe);
-      const pool = safeLines.length ? safeLines : scored;
-      pool.sort((a, b) => b.score - a.score);
-      return pool[0]!.ln.moves;
-    }
-
-    const line = pickLineByRules();
-    // Execute the full planned line consistently across the turn.
-    const queue = [...line];
+    const queue = [...plan.line] as PlannedMove[];
     const first = queue.shift() ?? null;
     cpuPlannedLineRef.current = queue;
     return first;
@@ -1455,6 +1509,7 @@ export default function Page() {
 
   function handleTileClick(idx: number) {
     if (!canInteract) return;
+    if (isProcessingRef.current || isAnimatingMove || moveOverlay) return;
 
     if (selected === null) {
       setSelected(idx);
@@ -1486,7 +1541,10 @@ export default function Page() {
     setMoveOverlay(null);
     setIsAnimatingMove(false);
     applyMove(from, to);
-    window.setTimeout(() => setIsProcessing(false), 0);
+    window.setTimeout(() => {
+      setIsProcessing(false);
+      isProcessingRef.current = false;
+    }, 0);
   }
 
   useEffect(() => {
@@ -1537,6 +1595,7 @@ export default function Page() {
   useEffect(() => {
     if (screen !== "play" || isPaused || winner) return;
     if (isAnimatingMove || moveOverlay) return;
+    if (timeLeftMs === null) return;
     if (timeLeftMs > 0) return;
     if (mode === "cpu" && currentPlayer === 2) return;
     if (mode === "online" && (!online || online.player !== currentPlayer)) return;
@@ -1550,6 +1609,21 @@ export default function Page() {
 
   return (
     <main className="min-h-[100dvh] text-zinc-900">
+      {/* Gooey (slime/water merge) effect */}
+      <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
+        <defs>
+          <filter id="gooey">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="7" result="blur" />
+            <feColorMatrix
+              in="blur"
+              mode="matrix"
+              values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 22 -11"
+              result="gooey"
+            />
+            <feComposite in="SourceGraphic" in2="gooey" operator="atop" />
+          </filter>
+        </defs>
+      </svg>
       {/* Cream polka dots (back layer) */}
       <div
         className="fixed inset-0 -z-20"
@@ -1565,19 +1639,24 @@ export default function Page() {
       {/* Floating Background (between dots and panels) */}
       <div className="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
         {[
-          { left: "12%", top: "72%", size: 140, color: "rgba(255,140,190,.30)" },
-          { left: "28%", top: "20%", size: 110, color: "rgba(255,210,120,.30)" },
-          { left: "52%", top: "58%", size: 170, color: "rgba(140,255,205,.30)" },
-          { left: "72%", top: "28%", size: 120, color: "rgba(150,200,255,.30)" },
-          { left: "86%", top: "66%", size: 180, color: "rgba(255,170,120,.30)" },
-          { left: "40%", top: "40%", size: 100, color: "rgba(210,160,255,.28)" },
-          { left: "62%", top: "82%", size: 120, color: "rgba(120,255,240,.26)" },
-          { left: "18%", top: "36%", size: 90, color: "rgba(255,210,235,.26)" },
+          { left: "12%", top: "72%", size: 140, color: "rgba(255,140,190,.44)" },
+          { left: "28%", top: "20%", size: 110, color: "rgba(255,210,120,.44)" },
+          { left: "52%", top: "58%", size: 170, color: "rgba(140,255,205,.44)" },
+          { left: "72%", top: "28%", size: 120, color: "rgba(150,200,255,.44)" },
+          { left: "86%", top: "66%", size: 180, color: "rgba(255,170,120,.44)" },
+          { left: "40%", top: "40%", size: 100, color: "rgba(210,160,255,.42)" },
+          { left: "62%", top: "82%", size: 120, color: "rgba(120,255,240,.40)" },
+          { left: "18%", top: "36%", size: 90, color: "rgba(255,210,235,.40)" },
+          // extra accents around edges so they don't cover the main mode select card
+          { left: "4%", top: "10%", size: 80, color: "rgba(255,190,210,.40)" },
+          { left: "6%", top: "86%", size: 90, color: "rgba(180,225,255,.40)" },
+          { left: "90%", top: "14%", size: 80, color: "rgba(210,255,210,.42)" },
+          { left: "92%", top: "82%", size: 100, color: "rgba(255,210,170,.42)" },
         ].map((b, i) => (
           <motion.div
             key={i}
             className="absolute"
-            style={{ left: b.left, top: b.top, width: b.size, height: b.size, opacity: 0.3 }}
+            style={{ left: b.left, top: b.top, width: b.size, height: b.size, opacity: 0.42 }}
             animate={{
               y: [0, -30, 0],
               rotate: [0, 180, 360],
@@ -1593,7 +1672,7 @@ export default function Page() {
               className="h-full w-full rounded-[44px]"
               style={{
                 background: `radial-gradient(circle at 30% 25%, rgba(255,255,255,.60), transparent 55%), ${b.color}`,
-                boxShadow: "0 30px 90px rgba(120,70,40,.10)",
+                boxShadow: "0 30px 90px rgba(120,70,40,.14)",
               }}
             />
           </motion.div>
@@ -1601,7 +1680,105 @@ export default function Page() {
       </div>
       <div className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center px-4 py-4 md:py-6">
         <AnimatePresence mode="wait">
-        {screen === "menu" ? (
+        {screen === "title" ? (
+          <motion.div
+            key="title"
+            className="w-full"
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+          >
+            <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+              <div>
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
+                <div className="mt-2 text-4xl font-black tracking-tight text-zinc-900 md:text-5xl">ぷるぷらす</div>
+                <div className="mt-2 text-sm font-semibold text-zinc-600">スワイプ or クリックで合体。ぴったりを狙おう！</div>
+              </div>
+
+              <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                  type="button"
+                  onClick={() => {
+                    void startBgm();
+                    playSe("susumu");
+                    setScreen("menu");
+                  }}
+                  className="flex-1 whitespace-nowrap rounded-[28px] bg-gradient-to-r from-emerald-400 to-cyan-400 px-6 py-4 text-base font-extrabold text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  遊ぶ
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void startBgm();
+                    playSe("susumu");
+                    setScreen("settings");
+                  }}
+                  className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  設定
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        ) : screen === "settings" ? (
+          <motion.div
+            key="settings"
+            className="w-full"
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+          >
+            <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+              <div className="space-y-1">
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">SETTING</div>
+                <div className="text-3xl font-black tracking-tight text-zinc-900">音量設定</div>
+              </div>
+
+              <div className="grid w-full gap-6 sm:grid-cols-2">
+                <div className="rounded-[28px] border border-white/70 bg-white/75 p-4">
+                  <div className="text-sm font-black text-zinc-700">BGM音量</div>
+                  <div className="mt-1 text-xs font-semibold text-zinc-600">{bgmVolume}%</div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={bgmVolume}
+                    onChange={(e) => setBgmVolume(Number(e.target.value))}
+                    className="mt-3 w-full accent-teal-500"
+                  />
+                </div>
+                <div className="rounded-[28px] border border-white/70 bg-white/75 p-4">
+                  <div className="text-sm font-black text-zinc-700">SE音量</div>
+                  <div className="mt-1 text-xs font-semibold text-zinc-600">{seVolume}%</div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={seVolume}
+                    onChange={(e) => setSeVolume(Number(e.target.value))}
+                    className="mt-3 w-full accent-fuchsia-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    playSe("modoru");
+                    setScreen("title");
+                  }}
+                  className="rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  戻る
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        ) : screen === "menu" ? (
           <motion.div
             key="menu"
             className="w-full"
@@ -1650,6 +1827,18 @@ export default function Page() {
                 <div className="text-sm font-semibold text-zinc-600 md:text-base">
                   スワイプ or クリックで合体。ぴったり {menuTarget} を狙おう！
                 </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playSe("modoru");
+                      setScreen("title");
+                    }}
+                    className="rounded-2xl border border-white/70 bg-white/85 px-4 py-2 text-xs font-black text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  >
+                    タイトルへ戻る
+                  </button>
+                </div>
               </header>
 
               <div className="grid gap-3 md:grid-cols-2">
@@ -1665,7 +1854,10 @@ export default function Page() {
                   <div className="mt-2 grid grid-cols-3 gap-2">
                     <JellySelectButton
                       selected={menuMode === "local"}
-                      onClick={() => setMenuMode("local")}
+                      onClick={() => {
+                        playSe("sentaku");
+                        setMenuMode("local");
+                      }}
                       label="対人"
                       variant="tile"
                       imgSrc="/images/vs_player.png"
@@ -1675,7 +1867,10 @@ export default function Page() {
                     />
                     <JellySelectButton
                       selected={menuMode === "cpu"}
-                      onClick={() => setMenuMode("cpu")}
+                      onClick={() => {
+                        playSe("sentaku");
+                        setMenuMode("cpu");
+                      }}
                       label="CPU"
                       variant="tile"
                       imgSrc="/images/vs_cpu.png"
@@ -1685,7 +1880,10 @@ export default function Page() {
                     />
                     <JellySelectButton
                       selected={menuMode === "online"}
-                      onClick={() => setMenuMode("online")}
+                      onClick={() => {
+                        playSe("sentaku");
+                        setMenuMode("online");
+                      }}
                       label="オンライン"
                       variant="tile"
                       imgSrc="/images/vs_online.png"
@@ -1697,13 +1895,16 @@ export default function Page() {
                 </div>
 
                 <div className="rounded-[28px] border border-white/70 bg-white/75 p-4 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
-                  <div className="text-xs font-black tracking-widest text-zinc-500">ゴール数値</div>
+                  <div className="text-xs font-black tracking-widest text-zinc-500">ゴール数値（25がおすすめ）</div>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {Array.from({ length: 7 }, (_, i) => 20 + i * 5).map((t) => (
+                    {[20, 25, 30, 40, 50].map((t) => (
                       <motion.button
                         key={t}
                         type="button"
-                        onClick={() => setMenuTarget(t)}
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuTarget(t);
+                        }}
                         className={[
                           "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform active:scale-[0.98]",
                           menuTarget === t
@@ -1733,7 +1934,10 @@ export default function Page() {
                       <button
                         key={o.id}
                         type="button"
-                        onClick={() => setMenuFirstTurn(o.id)}
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuFirstTurn(o.id);
+                        }}
                         className={[
                           "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform active:scale-[0.98]",
                           menuFirstTurn === o.id
@@ -1741,6 +1945,35 @@ export default function Page() {
                             : "border-white/70 bg-white/80 text-zinc-700 hover:brightness-105",
                         ].join(" ")}
                         aria-pressed={menuFirstTurn === o.id}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="mt-4 text-xs font-black tracking-widest text-zinc-500">制限時間</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {(
+                      [
+                        { id: "15", label: "15秒" },
+                        { id: "30", label: "30秒" },
+                        { id: "none", label: "制限なし" },
+                      ] as const
+                    ).map((o) => (
+                      <button
+                        key={o.id}
+                        type="button"
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuTimeLimit(o.id);
+                        }}
+                        className={[
+                          "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)] transition-transform active:scale-[0.98]",
+                          menuTimeLimit === o.id
+                            ? "border-white bg-gradient-to-r from-emerald-200 to-cyan-200 text-zinc-800"
+                            : "border-white/70 bg-white/80 text-zinc-700 hover:brightness-105",
+                        ].join(" ")}
+                        aria-pressed={menuTimeLimit === o.id}
                       >
                         {o.label}
                       </button>
@@ -1775,7 +2008,10 @@ export default function Page() {
                             selected={menuDifficulty === o.id}
                             disabled={locked}
                             onClick={() => {
-                              if (!locked) setMenuDifficulty(o.id);
+                              if (!locked) {
+                                playSe("sentaku");
+                                setMenuDifficulty(o.id);
+                              }
                             }}
                             label={o.label}
                             variant="tile"
@@ -1796,7 +2032,10 @@ export default function Page() {
                     <div className="mt-2 flex flex-wrap gap-2">
                       <button
                         type="button"
-                        onClick={() => setMenuOnlineRole("host")}
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuOnlineRole("host");
+                        }}
                         className={[
                           "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)]",
                           menuOnlineRole === "host"
@@ -1809,7 +2048,10 @@ export default function Page() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setMenuOnlineRole("guest")}
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuOnlineRole("guest");
+                        }}
                         className={[
                           "whitespace-nowrap rounded-[999px] border px-5 py-3 text-sm font-extrabold shadow-[0_18px_0_rgba(255,255,255,.7)_inset,0_18px_34px_rgba(90,60,160,.14)]",
                           menuOnlineRole === "guest"
@@ -1830,7 +2072,10 @@ export default function Page() {
                       />
                       <button
                         type="button"
-                        onClick={() => setMenuRoomId(Math.random().toString(36).slice(2, 8))}
+                        onClick={() => {
+                          playSe("sentaku");
+                          setMenuRoomId(Math.random().toString(36).slice(2, 8));
+                        }}
                         className="shrink-0 whitespace-nowrap rounded-2xl border border-white/70 bg-white/85 px-4 py-3 text-sm font-extrabold text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset]"
                       >
                         生成
@@ -1873,7 +2118,14 @@ export default function Page() {
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col items-center gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+            <div className="relative flex flex-col items-center gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+              <button
+                type="button"
+                onClick={() => void cancelMatchingAndBackToMenu()}
+                className="absolute left-4 top-4 rounded-2xl border border-white/70 bg-white/85 px-4 py-2 text-xs font-black text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+              >
+                戻る（キャンセル）
+              </button>
               <div className="text-xs font-black tracking-[0.25em] text-zinc-500">MATCHING</div>
               <div className="text-3xl font-black tracking-tight text-zinc-900">対戦相手を探しています...</div>
               <div className="text-sm font-semibold text-zinc-600">最大30秒ほどかかる場合があります</div>
@@ -1929,20 +2181,32 @@ export default function Page() {
                     <motion.div
                       className={[
                         "rounded-[999px] border px-3 py-1 text-xs font-black shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]",
-                        timeLeftSec <= 10 ? "border-red-300 bg-red-50 text-red-700" : "border-white/70 bg-white/75 text-zinc-700",
+                        timeLeftSec !== null && timeLeftSec <= 10
+                          ? "border-red-300 bg-red-50 text-red-700"
+                          : "border-white/70 bg-white/75 text-zinc-700",
                       ].join(" ")}
-                      animate={timeLeftSec <= 10 ? { x: [0, -2, 2, -2, 2, 0] } : { x: 0 }}
-                      transition={timeLeftSec <= 10 ? { duration: 0.35, repeat: Infinity } : { duration: 0.2 }}
+                      animate={timeLeftSec !== null && timeLeftSec <= 10 ? { x: [0, -2, 2, -2, 2, 0] } : { x: 0 }}
+                      transition={timeLeftSec !== null && timeLeftSec <= 10 ? { duration: 0.35, repeat: Infinity } : { duration: 0.2 }}
                     >
-                      {timeLeftSec}s
+                      {timeLeftSec === null ? "∞" : `${timeLeftSec}s`}
                     </motion.div>
                   )}
                 </div>
                 {!winner && (
                   <div className="h-3 w-full max-w-sm overflow-hidden rounded-full border border-white/70 bg-white/70">
                     <motion.div
-                      className={timeLeftSec <= 10 ? "h-full bg-red-400" : "h-full bg-gradient-to-r from-emerald-300 to-cyan-300"}
-                      animate={{ width: `${Math.min(100, Math.max(0, (timeLeftMs / 30000) * 100))}%` }}
+                      className={
+                        timeLeftSec !== null && timeLeftSec <= 10
+                          ? "h-full bg-red-400"
+                          : "h-full bg-gradient-to-r from-emerald-300 to-cyan-300"
+                      }
+                      animate={{
+                        width: `${
+                          timeLeftMs === null || timeLimitMsRef.current === null
+                            ? 100
+                            : Math.min(100, Math.max(0, (timeLeftMs / timeLimitMsRef.current) * 100))
+                        }%`,
+                      }}
                       transition={{ duration: 0.12, ease: "linear" }}
                     />
                   </div>
@@ -2082,8 +2346,8 @@ export default function Page() {
                       const isSelected = selected === idx;
                       const isFlashing = flashIndex === idx;
                       const isWinningTile = value === targetRef.current;
-                      const isDimmed =
-                        isAnimatingMove && moveOverlay && (idx === moveOverlay.from || idx === moveOverlay.to);
+                      const isMovingPair =
+                        moveOverlay && (idx === moveOverlay.from || idx === moveOverlay.to);
 
                       return (
                         <motion.button
@@ -2102,9 +2366,13 @@ export default function Page() {
                             isSelected ? "ring-4 ring-white/70" : "ring-0",
                             isFlashing ? "tile-flash" : "",
                             isWinningTile ? "ring-4 ring-emerald-400/60" : "",
-                            isDimmed ? "opacity-45" : "",
+                          isMovingPair ? "opacity-0 scale-[0.85]" : "",
                           ].join(" ")}
-                          style={tileStyle(value, targetRef.current)}
+                          style={
+                            isMovingPair
+                              ? { background: "transparent", borderColor: "transparent", boxShadow: "none" }
+                              : tileStyle(value, targetRef.current)
+                          }
                           aria-label={`Tile ${idx + 1}: ${value}`}
                           ref={(el) => {
                             tileRefs.current[idx] = el;
@@ -2115,7 +2383,15 @@ export default function Page() {
                           <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
                           <div className="absolute inset-0 rounded-3xl bg-gradient-to-b from-white/30 to-transparent opacity-70" />
                           <div className="relative text-5xl font-black tabular-nums tracking-tight text-black/70 md:text-6xl">
-                            <span className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{value}</span>
+                            <span
+                              className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]"
+                              style={{
+                                opacity: isMovingPair ? 0 : 1,
+                                transition: isMovingPair ? "none" : "opacity 120ms ease-out",
+                              }}
+                            >
+                              {value}
+                            </span>
                           </div>
 
                           {isSelected && (
@@ -2131,31 +2407,139 @@ export default function Page() {
                   )}
 
                   <AnimatePresence>
-                    {moveOverlay && (
-                      <motion.div
-                        key={moveOverlay.id}
-                        className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-2 text-5xl font-black tabular-nums text-black/70"
-                        style={{
-                          background: tileStyle(moveOverlay.value, targetRef.current).background,
-                          borderColor: tileStyle(moveOverlay.value, targetRef.current).borderColor,
-                          boxShadow: tileStyle(moveOverlay.value, targetRef.current).boxShadow,
-                          x: moveOverlay.fromCenter.x - 48,
-                          y: moveOverlay.fromCenter.y - 48,
-                        }}
-                        initial={{ scale: 1, opacity: 1 }}
-                        animate={{
-                          x: moveOverlay.toCenter.x - 48,
-                          y: moveOverlay.toCenter.y - 48,
-                          scale: 0.88,
-                          opacity: 0.98,
-                        }}
-                        exit={{ opacity: 0 }}
-                        transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.75 }}
-                        onAnimationComplete={finishMove}
-                      >
-                        <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
-                        <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.value}</div>
-                      </motion.div>
+                    {moveOverlay && mergeAnim && (
+                      <>
+                        {/* Incoming block (slime pulls toward fusion point) */}
+                        <motion.div
+                          key={`${moveOverlay.id}-from`}
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
+                          style={{
+                            background: tileStyle(moveOverlay.fromValue, targetRef.current).background,
+                            borderColor: tileStyle(moveOverlay.fromValue, targetRef.current).borderColor,
+                            boxShadow: tileStyle(moveOverlay.fromValue, targetRef.current).boxShadow,
+                            filter: "url(#gooey)",
+                          }}
+                          initial={{ x: mergeAnim.fromTL.x, y: mergeAnim.fromTL.y, scaleX: 1, scaleY: 1, opacity: 1, borderRadius: "30px" }}
+                          animate={{
+                            x: [mergeAnim.fromTL.x, mergeAnim.fusionTL.x + mergeAnim.ux * mergeAnim.wobblePx, mergeAnim.fusionTL.x],
+                            y: [mergeAnim.fromTL.y, mergeAnim.fusionTL.y + mergeAnim.uy * mergeAnim.wobblePx, mergeAnim.fusionTL.y],
+                            scaleX: [1, 1.42, 0.12],
+                            scaleY: [1, 0.72, 0.12],
+                            rotate: [0, mergeAnim.rotateDeg, 0],
+                            borderRadius: ["30px", "999px", "30px"],
+                            opacity: [1, 0, 0],
+                          }}
+                          exit={{ opacity: 0 }}
+                          transition={{
+                            duration: 0.42,
+                            times: [0, 0.22, 1],
+                            type: "tween",
+                            ease: "backInOut",
+                          }}
+                        >
+                          <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
+                          <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.fromValue}</div>
+                        </motion.div>
+
+                        {/* Merging block (victim does a tiny reverse preload before collision) */}
+                        <motion.div
+                          key={`${moveOverlay.id}-to`}
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
+                          style={{
+                            background: tileStyle(moveOverlay.toValueBefore, targetRef.current).background,
+                            borderColor: tileStyle(moveOverlay.toValueBefore, targetRef.current).borderColor,
+                            boxShadow: tileStyle(moveOverlay.toValueBefore, targetRef.current).boxShadow,
+                            filter: "url(#gooey)",
+                          }}
+                          initial={{ x: mergeAnim.toTL.x, y: mergeAnim.toTL.y, scaleX: 1, scaleY: 1, opacity: 1, borderRadius: "30px" }}
+                          animate={{
+                            x: [
+                              mergeAnim.toTL.x,
+                              mergeAnim.toTL.x - mergeAnim.ux * mergeAnim.prePushPx,
+                              mergeAnim.fusionTL.x,
+                            ],
+                            y: [
+                              mergeAnim.toTL.y,
+                              mergeAnim.toTL.y - mergeAnim.uy * mergeAnim.prePushPx,
+                              mergeAnim.fusionTL.y,
+                            ],
+                            scaleX: [1, 0.86, 0.12],
+                            scaleY: [1, 1.12, 0.12],
+                            rotate: [0, -mergeAnim.rotateDeg * 0.8, 0],
+                            borderRadius: ["30px", "999px", "30px"],
+                            opacity: [1, 0, 0],
+                          }}
+                          exit={{ opacity: 0 }}
+                          transition={{
+                            duration: 0.42,
+                            times: [0, 0.22, 1],
+                            type: "tween",
+                            ease: "backInOut",
+                          }}
+                        >
+                          <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
+                          <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueBefore}</div>
+                        </motion.div>
+
+                        {/* Collision splash (water-mix / slime texture) */}
+                        <motion.div
+                          key={`${moveOverlay.id}-splash`}
+                          className="pointer-events-none absolute left-0 top-0 z-9 h-24 w-24 rounded-full"
+                          style={{
+                            background: `radial-gradient(circle at 50% 50%, rgba(255,255,255,.88), ${tileStyle(
+                              moveOverlay.toValueAfter,
+                              targetRef.current
+                            ).background} 40%, rgba(255,255,255,0) 70%)`,
+                            filter: "blur(2px)",
+                            mixBlendMode: "screen",
+                          }}
+                          initial={{ x: mergeAnim.fusionTL.x, y: mergeAnim.fusionTL.y, scale: 0.12, opacity: 0 }}
+                          animate={{
+                            scale: [0.12, 0.12, 1.35, 0.7],
+                            opacity: [0, 0.05, 0.55, 0],
+                            rotate: [0, 0, 18, 0],
+                          }}
+                          transition={{
+                            duration: 0.42,
+                            times: [0, 0.68, 0.82, 1],
+                            type: "tween",
+                            ease: "backInOut",
+                          }}
+                        />
+
+                        {/* Fusion result (pull -> squish -> ploon bounce) */}
+                        <motion.div
+                          key={`${moveOverlay.id}-fusion`}
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-2 text-5xl font-black tabular-nums text-black/70"
+                          style={{
+                            background: tileStyle(moveOverlay.toValueAfter, targetRef.current).background,
+                            borderColor: tileStyle(moveOverlay.toValueAfter, targetRef.current).borderColor,
+                            boxShadow: tileStyle(moveOverlay.toValueAfter, targetRef.current).boxShadow,
+                          }}
+                          initial={{ x: mergeAnim.fusionTL.x, y: mergeAnim.fusionTL.y, opacity: 0, scale: 1 }}
+                          animate={{ x: mergeAnim.toTL.x, y: mergeAnim.toTL.y, opacity: 0.98 }}
+                          transition={{ type: "spring", stiffness: 920, damping: 22, mass: 0.65, duration: 0.42 }}
+                          exit={{ opacity: 0 }}
+                          onAnimationComplete={finishMove}
+                        >
+                          <motion.div
+                            className="relative h-full w-full"
+                            initial={{ scale: 0.98, rotate: -6, borderRadius: "30px" }}
+                            animate={{
+                              // squash & stretch (liquid snap + soft settle)
+                              scaleX: [0.78, 1.42, 0.96, 1.06, 1],
+                              scaleY: [0.92, 0.86, 1.14, 0.98, 1],
+                              rotate: [-7, 3, -2, 1, 0],
+                              borderRadius: ["999px", "22px", "34px", "26px", "30px"],
+                            }}
+                            transition={{ duration: 0.55, ease: "easeOut" }}
+                            style={{ transformOrigin: "center" }}
+                          >
+                            <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
+                            <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueAfter}</div>
+                          </motion.div>
+                        </motion.div>
+                      </>
                     )}
                   </AnimatePresence>
                 </div>
@@ -2351,6 +2735,31 @@ export default function Page() {
         </motion.div>
       )}
       </AnimatePresence>
+
+      {screen === "title" && (
+        <div className="fixed bottom-4 left-0 right-0 z-30 flex justify-center px-4 pointer-events-auto">
+          <div className="text-center text-xs font-semibold text-zinc-600 drop-shadow">
+            Sound by{" "}
+            <a
+              href="https://dova-s.jp/"
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2 hover:text-zinc-900"
+            >
+              DOVA-SYNDROME
+            </a>{" "}
+            &{" "}
+            <a
+              href="https://otologic.jp/"
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2 hover:text-zinc-900"
+            >
+              OtoLogic
+            </a>
+          </div>
+        </div>
+      )}
 
       <style jsx global>{`
         @keyframes tileFlash {
