@@ -9,9 +9,37 @@ const zenMaru = Zen_Maru_Gothic({
   weight: ["700", "900"],
 });
 
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
+
 export const metadata: Metadata = {
-  title: "ぷるぷらす（Puru Plus）",
-  description: "ぷるぷらす（Puru Plus）",
+  metadataBase: new URL(siteUrl),
+  title: "ぷるぷらす",
+  description:
+    "パズル、無料、ブラウザ、オンライン対戦！数字を合体してゴールを目指そう。「ぷるぷらす」公式サイト。",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    title: "ぷるぷらす",
+    description:
+      "パズル、無料、ブラウザ、オンライン対戦！数字を合体してゴールを目指そう。「ぷるぷらす」公式サイト。",
+    images: [
+      {
+        url: "/images/vs_online.png",
+        width: 1200,
+        height: 630,
+        alt: "ぷるぷらす OGP",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "ぷるぷらす",
+    description:
+      "パズル、無料、ブラウザ、オンライン対戦！数字を合体してゴールを目指そう。「ぷるぷらす」公式サイト。",
+    images: ["/images/vs_online.png"],
+  },
   icons: {
     icon: [{ url: "/images/easy.png", type: "image/png" }],
   },
@@ -23,7 +51,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="ja">
       <body className={`${zenMaru.variable} min-h-[100dvh] antialiased`}>
         <div className="min-h-[100dvh]">
           {children}

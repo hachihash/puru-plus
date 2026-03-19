@@ -12,7 +12,7 @@ type GameMode = "cpu" | "local" | "online";
 type CpuDifficulty = "easy" | "normal" | "hard" | "god";
 type TargetValue = number;
 type FirstTurn = "p1" | "p2" | "random";
-type Screen = "title" | "menu" | "settings" | "onlineWaiting" | "matching" | "play";
+type Screen = "title" | "menu" | "settings" | "onlineWaiting" | "matching" | "play" | "stats";
 type TimeLimitChoice = "15" | "30" | "none";
 
 type OnlineRole = "host" | "guest";
@@ -31,6 +31,38 @@ type PublicMatchRow = {
   status: "waiting" | "playing";
 };
 
+// Supabase: プレイヤーごとの Elo レートを保持するテーブルの形を想定
+// （実際の DB スキーマに合わせて調整してください）
+type PlayerRatingRow = {
+  user_id: string;
+  rating: number;
+  updated_at?: string;
+};
+
+// Supabase: 1試合ごとの履歴（勝敗/ターン数/種類など）を保存するテーブルを想定
+type MatchHistoryInsert = {
+  player1_id: string;
+  player2_id: string;
+  winner_id: string;
+  turns: number;
+  // match_type は Stats で集計するため、CPUも含めて種類を区別する
+  match_type: "random" | "room" | "cpu_easy" | "cpu_normal" | "cpu_hard" | "cpu_god";
+  // 25 が初めて盤面に出るまでのターン数（未達なら null）
+  turns_to_goal25?: number | null;
+  created_at: string;
+};
+
+type MatchHistoryRow = {
+  id?: number;
+  player1_id: string;
+  player2_id: string;
+  winner_id: string;
+  turns: number;
+  match_type: string;
+  turns_to_goal25?: number | null;
+  created_at: string;
+};
+
 type OnlineBroadcastState = {
   clientId: string;
   target: number;
@@ -40,6 +72,7 @@ type OnlineBroadcastState = {
   nextIndex: number;
   currentPlayer: Player;
   movesLeft: number;
+  turns: number;
   winner: Winner;
   startingPlayer: Player;
   actionDeadlineMs?: number | null;
@@ -64,6 +97,55 @@ const SE_GAINS: Record<string, number> = {
 function randInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
+
+/**
+ * Elo レーティング更新用の計算関数（ランダム対戦のみ使用）
+ *
+ * - expectedA: A が勝つ確率（B のレートから算出）
+ * - scoreA: 実結果（勝ち=1, 負け=0。引き分けはこのゲームでは想定しない）
+ * - newRating = rating + K * (score - expected)
+ */
+function calcEloAfterMatch(params: {
+  ratingA: number;
+  ratingB: number;
+  winner: "A" | "B";
+  kFactor?: number; // 32 前後を想定
+}): { newRatingA: number; newRatingB: number } {
+  const { ratingA, ratingB, winner } = params;
+  const K = params.kFactor ?? 32;
+
+  const expectedA = 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
+  const expectedB = 1 - expectedA;
+
+  const scoreA = winner === "A" ? 1 : 0;
+  const scoreB = winner === "B" ? 1 : 0;
+
+  const newRatingA = Math.round(ratingA + K * (scoreA - expectedA));
+  const newRatingB = Math.round(ratingB + K * (scoreB - expectedB));
+
+  return { newRatingA, newRatingB };
+}
+
+function safeStringify(value: unknown) {
+  // Error オブジェクトは JSON stringify しないと {} になりやすいため、
+  // 可能な範囲で中身を文字列化する（デバッグ用途）。
+  try {
+    return JSON.stringify(value, (_k, v) => {
+      if (typeof v === "bigint") return v.toString();
+      return v;
+    }, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+type SupabaseErrorLike = {
+  message?: string;
+  details?: string;
+  hint?: string;
+  status?: number;
+  code?: string;
+};
 
 function makeInitialBoard(): number[] {
   return Array.from({ length: TILE_COUNT }, () => randInt(1, 9));
@@ -459,6 +541,51 @@ export default function Page() {
   const [matchId, setMatchId] = useState<number | null>(null);
   const [matchNotFound, setMatchNotFound] = useState(false);
 
+  // match_type for DB/SEO purposes
+  // - "random": ランダム対戦（オンラインのキュー + BOTフォールバック）
+  // - "room": ルーム対戦（ID入力によるオンライン対戦）
+  const [matchType, setMatchType] = useState<"random" | "room" | null>(null);
+
+  // Rating states (used only for random matches)
+  const [playerRate, setPlayerRate] = useState<number>(1500);
+  const [opponentRate, setOpponentRate] = useState<number>(1500);
+  const [rateLoading, setRateLoading] = useState<boolean>(false);
+
+  // Opponent's user id (presence or BOT fallback)
+  const [onlineOpponentUserId, setOnlineOpponentUserId] = useState<string>("");
+
+  // Stats UI states
+  const [statsLoading, setStatsLoading] = useState<boolean>(false);
+  const [statsError, setStatsError] = useState<string | null>(null);
+  const [statsPayload, setStatsPayload] = useState<{
+    onlineMatches: number;
+    onlineWins: number;
+    onlineWinRate: number | null;
+    currentRate: number;
+    cpuWins: { easy: number; normal: number; hard: number; god: number };
+    avgTurnsToGoal25: number | null;
+    maxWinStreak: number;
+    hasAnyHistory: boolean;
+  } | null>(null);
+
+  // 戦績画面の「強制再取得」用（screenが変わらないケースも想定してリフレッシュ）
+  const [statsRefreshNonce, setStatsRefreshNonce] = useState(0);
+
+  // BOTレート偽装（表示だけを見せかける）
+  const [botDisplayedOpponentRate, setBotDisplayedOpponentRate] = useState<number>(1500);
+  const botDisplayGeneratedRef = useRef<boolean>(false);
+
+  // リザルト画面のレート変動表示（アニメーション用）
+  const [resultRateChange, setResultRateChange] = useState<{
+    yourBefore: number;
+    yourAfter: number;
+    opponentBefore: number;
+    opponentAfter: number;
+    yourDelta: number;
+    opponentDelta: number;
+  } | null>(null);
+  const [resultRateNonce, setResultRateNonce] = useState(0);
+
   // Online waiting (room ID sync)
   const [onlineWaitingRoomId, setOnlineWaitingRoomId] = useState<string>("");
   const onlineStartOnceRef = useRef(false);
@@ -483,6 +610,178 @@ export default function Page() {
     return () => window.clearTimeout(id);
   }, [cpuFallbackMessage]);
 
+  // Randomマッチ時にレーティングを取得してヘッダー表示に反映する
+  useEffect(() => {
+    if (matchType !== "random") return;
+    if (screen !== "play" && screen !== "onlineWaiting") return;
+    if (hasFetchedRatesForMatchRef.current) return;
+    if (!onlineOpponentUserId) return; // online/ボット共通で相手 userId が必要
+
+    hasFetchedRatesForMatchRef.current = true;
+    setRateLoading(true);
+    void (async () => {
+      const myUserId = getClientId();
+      const oppUserId = onlineOpponentUserId;
+      try {
+        const [myRate, oppRate] = await Promise.all([
+          getOrCreatePlayerRating(myUserId),
+          getOrCreatePlayerRating(oppUserId),
+        ]);
+        setPlayerRate(myRate);
+        setOpponentRate(oppRate);
+      } finally {
+        setRateLoading(false);
+      }
+    })();
+  }, [matchType, screen, onlineOpponentUserId]);
+
+  useEffect(() => {
+    // BOTの場合は「表示だけ」それっぽいレートに偽装します（DBの Elo はそのまま）。
+    if (!onlineBotFallback) return;
+    if (matchType !== "random") return;
+    if (rateLoading) return;
+    if (botDisplayGeneratedRef.current) return;
+
+    const min = Math.max(0, playerRate - 50);
+    const max = playerRate + 50;
+    const fake = randInt(min, max);
+    setBotDisplayedOpponentRate(fake);
+    botDisplayGeneratedRef.current = true;
+  }, [onlineBotFallback, matchType, rateLoading, playerRate]);
+
+  // 戦績（スタッツ）画面：DBから対戦履歴を取得→集計して表示
+  useEffect(() => {
+    if (screen !== "stats") return;
+
+    setStatsError(null);
+    setStatsPayload(null);
+    setStatsLoading(true);
+
+    void (async () => {
+      const userId = getClientId();
+
+      try {
+        // 1) 現在の Elo（user_id のレコードから取得。無ければ 1500）
+        const { data: ratingRow } = await supabase
+          .from("player_ratings")
+          .select("user_id,rating")
+          .eq("user_id", userId)
+          .maybeSingle<PlayerRatingRow>();
+
+        const currentRate = ratingRow?.rating && Number.isFinite(ratingRow.rating) ? Math.round(ratingRow.rating) : 1500;
+
+        // 2) 自分が関わった match_history を取得
+        //    Supabase では OR 文字列が分かりにくいので、player1/player2 を分けて取得→結合します。
+        // `turns_to_goal25` 列がまだ DB に存在しない可能性があるため、
+        // 先に取得を試して、失敗した場合は列を省略して再取得します。
+        const [h1, h2] = await Promise.all([
+          supabase
+            .from("match_history")
+            .select("id,player1_id,player2_id,winner_id,turns,match_type,turns_to_goal25,created_at")
+            .eq("player1_id", userId),
+          supabase
+            .from("match_history")
+            .select("id,player1_id,player2_id,winner_id,turns,match_type,turns_to_goal25,created_at")
+            .eq("player2_id", userId),
+        ]);
+
+        let rows1 = (h1.data ?? []) as MatchHistoryRow[];
+        let rows2 = (h2.data ?? []) as MatchHistoryRow[];
+
+        if (h1.error || h2.error) {
+          const [h1b, h2b] = await Promise.all([
+            supabase
+              .from("match_history")
+              .select("id,player1_id,player2_id,winner_id,turns,match_type,created_at")
+              .eq("player1_id", userId),
+            supabase
+              .from("match_history")
+              .select("id,player1_id,player2_id,winner_id,turns,match_type,created_at")
+              .eq("player2_id", userId),
+          ]);
+          rows1 = (h1b.data ?? []) as MatchHistoryRow[];
+          rows2 = (h2b.data ?? []) as MatchHistoryRow[];
+        }
+
+        // 2重取得の可能性が低い想定だが、万一に備えて id を見て重複除去する
+        const byId = new Map<number | string, MatchHistoryRow>();
+        for (const r of [...rows1, ...rows2]) {
+          const key = r.id ?? `${r.player1_id}-${r.player2_id}-${r.created_at}`;
+          byId.set(key, r);
+        }
+
+        const history = Array.from(byId.values());
+
+        if (history.length === 0) {
+          setStatsPayload({
+            onlineMatches: 0,
+            onlineWins: 0,
+            onlineWinRate: null,
+            currentRate,
+            cpuWins: { easy: 0, normal: 0, hard: 0, god: 0 },
+            avgTurnsToGoal25: null,
+            maxWinStreak: 0,
+            hasAnyHistory: false,
+          });
+          return;
+        }
+
+        // --- A. オンライン（random / room） ---
+        const onlineRows = history.filter((r) => r.match_type === "random" || r.match_type === "room");
+        const onlineMatches = onlineRows.length;
+        const onlineWins = onlineRows.filter((r) => r.winner_id === userId).length;
+        const onlineWinRate = onlineMatches > 0 ? Math.round((onlineWins / onlineMatches) * 1000) / 10 : null;
+
+        // --- B. CPU 勝利数（match_type = cpu_easy...） ---
+        const cpuWins = {
+          easy: history.filter((r) => r.match_type === "cpu_easy" && r.winner_id === userId).length,
+          normal: history.filter((r) => r.match_type === "cpu_normal" && r.winner_id === userId).length,
+          hard: history.filter((r) => r.match_type === "cpu_hard" && r.winner_id === userId).length,
+          god: history.filter((r) => r.match_type === "cpu_god" && r.winner_id === userId).length,
+        };
+
+        // --- C. プレイスタイル ---
+        // 25 を作るまでのターン数（turns_to_goal25）が入っている試合だけ平均する
+        const turnsToGoal25Values = history
+          .map((r) => r.turns_to_goal25)
+          .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+
+        const avgTurnsToGoal25 =
+          turnsToGoal25Values.length > 0
+            ? Math.round((turnsToGoal25Values.reduce((a, b) => a + b, 0) / turnsToGoal25Values.length) * 10) / 10
+            : null;
+
+        // 最大連勝数（勝利した試合が連続して続く区間）
+        const ordered = [...history].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+        let streak = 0;
+        let maxWinStreak = 0;
+        for (const r of ordered) {
+          if (r.winner_id === userId) {
+            streak += 1;
+            maxWinStreak = Math.max(maxWinStreak, streak);
+          } else {
+            streak = 0;
+          }
+        }
+
+        setStatsPayload({
+          onlineMatches,
+          onlineWins,
+          onlineWinRate,
+          currentRate,
+          cpuWins,
+          avgTurnsToGoal25,
+          maxWinStreak,
+          hasAnyHistory: true,
+        });
+      } catch {
+        setStatsError("データの取得に失敗しました。時間をおいて再度お試しください。");
+      } finally {
+        setStatsLoading(false);
+      }
+    })();
+  }, [screen, statsRefreshNonce]);
+
   const [bgmVolume, setBgmVolume] = useState<number>(70);
   const [seVolume, setSeVolume] = useState<number>(70);
 
@@ -495,6 +794,9 @@ export default function Page() {
   const [currentPlayer, setCurrentPlayer] = useState<Player>(1);
   const [startingPlayer, setStartingPlayer] = useState<Player>(1);
   const [movesLeft, setMovesLeft] = useState<number>(TURN_ACTIONS);
+  // "turns" = ゲーム終了までに進んだターン数（1ターン = 3アクションの塊）
+  // 記録/保存用。オンラインでは Authoritative state と一緒に同期する。
+  const [turns, setTurns] = useState<number>(1);
   const [mode, setMode] = useState<GameMode>("cpu");
   const [cpuDifficulty, setCpuDifficulty] = useState<CpuDifficulty>("normal");
   const [online, setOnline] = useState<OnlineState | null>(null);
@@ -522,11 +824,16 @@ export default function Page() {
   const nextNumberRef = useRef<number>(nextNumber);
   const currentPlayerRef = useRef<Player>(currentPlayer);
   const movesLeftRef = useRef<number>(movesLeft);
+  const turnsRef = useRef<number>(turns);
+  // 盤面上に「25」が初めて登場したタイミング（概算のターン数）
+  // スタッツの「25を作るまでの平均ターン数」用。
+  const turnsToGoal25Ref = useRef<number | null>(null);
   const modeRef = useRef<GameMode>(mode);
   const cpuDifficultyRef = useRef<CpuDifficulty>(cpuDifficulty);
   const targetRef = useRef<number>(target);
   const winnerRef = useRef<Winner>(winner);
   const timeLimitMsRef = useRef<number | null>(timeLimitMs);
+  const matchTypeRef = useRef<"random" | "room" | null>(matchType);
   const cpuTimeoutRef = useRef<number | null>(null);
   const cpuPlannedLineRef = useRef<PlannedMove[] | null>(null);
   const onlineChannelRef = useRef<RealtimeChannel | null>(null);
@@ -534,6 +841,10 @@ export default function Page() {
   const matchChannelRef = useRef<RealtimeChannel | null>(null);
   const matchIdRef = useRef<number | null>(matchId);
   const isProcessingRef = useRef<boolean>(isProcessing);
+  const hasFetchedRatesForMatchRef = useRef<boolean>(false);
+  const hasPersistedMatchRef = useRef<boolean>(false);
+  const playerRateRef = useRef<number>(playerRate);
+  const opponentRateRef = useRef<number>(opponentRate);
 
   // Audio management
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -558,9 +869,40 @@ export default function Page() {
   useEffect(() => {
     movesLeftRef.current = movesLeft;
   }, [movesLeft]);
+
+  useEffect(() => {
+    turnsRef.current = turns;
+  }, [turns]);
+
+  useEffect(() => {
+    playerRateRef.current = playerRate;
+  }, [playerRate]);
+
+  useEffect(() => {
+    opponentRateRef.current = opponentRate;
+  }, [opponentRate]);
+
+  useEffect(() => {
+    // 新しいゲーム開始時（screen が play になった瞬間）に 25 記録をリセット
+    if (screen === "play") turnsToGoal25Ref.current = null;
+  }, [screen]);
+
+  useEffect(() => {
+    // winner が決まった後は「25を作るまで」の計測は確定している想定なので変更しない。
+    if (screen !== "play") return;
+    if (winner) return;
+    if (turnsToGoal25Ref.current !== null) return;
+    if (!board.includes(25)) return;
+
+    // 盤面に 25 が初めて出た時点の turn を記録（概算）
+    turnsToGoal25Ref.current = turnsRef.current;
+  }, [board, screen, winner]);
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+  useEffect(() => {
+    matchTypeRef.current = matchType;
+  }, [matchType]);
   useEffect(() => {
     cpuDifficultyRef.current = cpuDifficulty;
   }, [cpuDifficulty]);
@@ -776,6 +1118,9 @@ export default function Page() {
   // ※ランダムでBOTになった場合も menuMode が "online" になるので、ここで同じUI扱いにする
   const isOnlineBattle = menuMode === "online" && screen === "play";
 
+  // 表示用の相手レート（BOTは UI だけ偽装する）
+  const opponentRateForDisplay = onlineBotFallback && matchType === "random" ? botDisplayedOpponentRate : opponentRate;
+
   const onlineRoleLabel = useMemo(() => {
     const myRole = menuOnlineRole;
     const myText = myRole === "host" ? "ホスト" : "ゲスト";
@@ -837,6 +1182,91 @@ export default function Page() {
     return id;
   }
 
+  /**
+   * Supabase から「そのユーザーの現在レート」を取得し、無ければ初期値(1500)で作成します。
+   * 初回ログインや BOT などで行が存在しないケースに対応するため、
+   * get-or-create（取得→無ければ作成）をこの関数に閉じ込めます。
+   */
+  async function getOrCreatePlayerRating(userId: string): Promise<number> {
+    const initialRating = 1500;
+    if (!userId) return initialRating;
+
+    // まずは既存行を検索
+    const { data, error } = await supabase
+      .from("player_ratings")
+      .select("user_id,rating")
+      .eq("user_id", userId)
+      .maybeSingle<PlayerRatingRow>();
+
+    if (error) {
+      // DBエラーがあってもゲーム自体は止めたくないので初期値で進行
+      console.error("[player_ratings select failed]", error, { userId });
+      return initialRating;
+    }
+
+    if (data && typeof data.rating === "number" && Number.isFinite(data.rating)) {
+      return Math.round(data.rating);
+    }
+
+    // 存在しない場合は初期値で作成（upsertで競合も吸収）
+    const { error: upsertError } = await supabase
+      .from("player_ratings")
+      .upsert({ user_id: userId, rating: initialRating } as unknown as Pick<PlayerRatingRow, "user_id" | "rating">, {
+        onConflict: "user_id",
+      });
+
+    if (upsertError) {
+      console.error("[player_ratings upsert failed]", upsertError, { userId, initialRating });
+      return initialRating;
+    }
+
+    return initialRating;
+  }
+
+  /**
+   * Supabase の player_ratings を新しいレートに更新します。
+   * Elo 計算は「ランダム対戦」だけで行うため、この関数は match_type が random の時に呼びます。
+   */
+  async function upsertPlayerRating(userId: string, newRating: number) {
+    if (!userId) return;
+    const { error } = await supabase
+      .from("player_ratings")
+      .upsert({ user_id: userId, rating: newRating } as unknown as Pick<PlayerRatingRow, "user_id" | "rating">, {
+        onConflict: "user_id",
+      });
+    if (error) {
+      console.error("[player_ratings upsert failed]", error, { userId, newRating });
+      throw error;
+    }
+  }
+
+  /**
+   * 1試合分の履歴を match_history に INSERT します。
+   * rating 更新とは独立に「対戦が終わった事実」を保存するのが目的です。
+   */
+  async function insertMatchHistory(row: MatchHistoryInsert) {
+    // Supabase/DB が受け付けない列（存在しないキー）を減らすため、
+    // undefined は送らない（null は「値あり」として扱う）。
+    const rowClean = Object.fromEntries(Object.entries(row).filter(([, v]) => v !== undefined));
+
+    const { error } = await supabase.from("match_history").insert(rowClean as Record<string, unknown>);
+    if (error) {
+      const err = error as unknown as SupabaseErrorLike;
+      console.error(
+        "[match_history insert failed]",
+        safeStringify({
+          message: err.message,
+          details: err.details,
+          hint: err.hint,
+          status: err.status,
+          code: err.code,
+        }),
+      );
+      console.error("[match_history insert payload]", safeStringify(rowClean));
+      throw error;
+    }
+  }
+
   async function leaveOnlineRoom() {
     if (onlineChannelRef.current) {
       await supabase.removeChannel(onlineChannelRef.current);
@@ -844,7 +1274,12 @@ export default function Page() {
     }
     setOnline(null);
     setOnlineOpponentName("");
+    setOnlineOpponentUserId("");
     setOnlineBotFallback(false);
+    setBotDisplayedOpponentRate(1500);
+    botDisplayGeneratedRef.current = false;
+    setResultRateChange(null);
+    setResultRateNonce((n) => n + 1);
   }
 
   async function leaveMatchChannel() {
@@ -877,6 +1312,10 @@ export default function Page() {
     await leaveMatchChannel();
     await leaveOnlineRoom();
     setMatchNotFound(false);
+    setMatchType(null);
+    setRateLoading(false);
+    setPlayerRate(1500);
+    setOpponentRate(1500);
     setScreen("menu");
   }
 
@@ -907,7 +1346,15 @@ export default function Page() {
 
     // random match は常に30秒（UI文言/タイマー整合）
     setTimeLimitMs(30_000);
+    setMatchType("random");
     setCpuThinking(false);
+    hasFetchedRatesForMatchRef.current = false;
+    hasPersistedMatchRef.current = false;
+    setRateLoading(true);
+    setResultRateChange(null);
+    setResultRateNonce((n) => n + 1);
+    setPlayerRate(1500);
+    setOpponentRate(1500);
     setOnlineBotFallback(false);
     setCpuFallbackMessage(null);
     setOnlineOpponentName("");
@@ -939,17 +1386,24 @@ export default function Page() {
 
         const fallbackCpu: CpuDifficulty = Math.random() < 0.5 ? "normal" : "hard";
         const dummyOpponent = `Player_${randInt(1000, 9999)}`;
+        // BOTは「疑似ユーザー」として Supabase 上でも rating を持てるように userId を別で作る
+        const dummyOpponentUserId = `bot_${dummyOpponent}`;
 
         randomMatchResolvedRef.current = true;
         setCpuFallbackMessage("対戦相手が見つかりました！");
         setOnlineOpponentName(dummyOpponent);
+        setOnlineOpponentUserId(dummyOpponentUserId);
         setOnlineBotFallback(true);
+        botDisplayGeneratedRef.current = false;
+        setBotDisplayedOpponentRate(1500);
         setTarget(snapshotTarget);
         setMode("cpu"); // CPUロジックをそのまま使う（UIはonline扱い）
         setCpuDifficulty(fallbackCpu);
         setStartingPlayer(1);
         setCurrentPlayer(1);
         setMovesLeft(TURN_ACTIONS);
+        turnsRef.current = 1;
+        setTurns(1);
         setSelected(null);
         setWinner(null);
         setFlashIndex(null);
@@ -1081,6 +1535,8 @@ export default function Page() {
             setStartingPlayer(1);
             setCurrentPlayer(1);
             setMovesLeft(TURN_ACTIONS);
+            turnsRef.current = 1;
+            setTurns(1);
             setSelected(null);
             setWinner(null);
             setFlashIndex(null);
@@ -1106,6 +1562,7 @@ export default function Page() {
               nextIndex: 0,
               currentPlayer: 1,
               movesLeft: TURN_ACTIONS,
+              turns: 1,
               winner: null,
               startingPlayer: 1,
               actionDeadlineMs: deadline,
@@ -1146,6 +1603,7 @@ export default function Page() {
       setStartingPlayer(data.startingPlayer);
       setCurrentPlayer(data.currentPlayer);
       setMovesLeft(data.movesLeft);
+      setTurns(typeof data.turns === "number" ? data.turns : 1);
       setWinner(data.winner);
       if ("actionDeadlineMs" in data) setActionDeadlineMs(typeof data.actionDeadlineMs === "number" ? data.actionDeadlineMs : null);
       setFlashIndex(null);
@@ -1172,18 +1630,21 @@ export default function Page() {
 
     channel.on("presence", { event: "sync" }, () => {
       // Presenceから相手プレイヤー名を拾う（ホスト/ゲスト共通）
-      const state = channel.presenceState() as Record<string, Array<{ player?: Player; name?: string }>>;
+      const state = channel.presenceState() as Record<string, Array<{ player?: Player; name?: string; userId?: string }>>;
       let opponent = "";
+      let opponentUserId = "";
       for (const entries of Object.values(state)) {
         for (const e of entries ?? []) {
-          if (e?.player === otherPlayer && typeof e?.name === "string" && e.name.trim()) {
-            opponent = e.name.trim();
+          if (e?.player === otherPlayer) {
+            if (typeof e?.name === "string" && e.name.trim()) opponent = e.name.trim();
+            if (typeof e?.userId === "string" && e.userId.trim()) opponentUserId = e.userId.trim();
             break;
           }
         }
         if (opponent) break;
       }
       if (opponent) setOnlineOpponentName(opponent);
+      if (opponentUserId) setOnlineOpponentUserId(opponentUserId);
 
       opts?.onPresenceSync?.(channel);
     });
@@ -1194,7 +1655,7 @@ export default function Page() {
     await channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         // `playerName` はローカル保存値。対戦相手に表示するため Presence に同梱する
-        await channel.track({ role, player, name: playerName });
+        await channel.track({ role, player, name: playerName, userId: clientId });
         setOnline({ enabled: true, roomId, role, player, clientId, ready: role === "host" });
       }
     });
@@ -1208,6 +1669,7 @@ export default function Page() {
     nextIndex: number;
     currentPlayer: Player;
     movesLeft: number;
+    turns: number;
     winner: Winner;
     startingPlayer: Player;
     actionDeadlineMs?: number | null;
@@ -1228,6 +1690,10 @@ export default function Page() {
     setCpuThinking(false);
     setOnlineBotFallback(false);
     setOnlineOpponentName("");
+    setResultRateChange(null);
+    setResultRateNonce((n) => n + 1);
+    setBotDisplayedOpponentRate(1500);
+    botDisplayGeneratedRef.current = false;
     setShowGodVictory(false);
     setPendingWinner(null);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
@@ -1244,6 +1710,12 @@ export default function Page() {
       const roomId = (menuRoomId || "").trim();
       if (!roomId) return;
       setTimeLimitMs(appliedLimit);
+      setMatchType("room");
+      hasFetchedRatesForMatchRef.current = false;
+      hasPersistedMatchRef.current = false;
+      setRateLoading(false);
+      setPlayerRate(1500);
+      setOpponentRate(1500);
       setOnlineWaitingRoomId(roomId);
       onlineStartOnceRef.current = false;
       setScreen("onlineWaiting");
@@ -1273,6 +1745,8 @@ export default function Page() {
           setStartingPlayer(1);
           setCurrentPlayer(1);
           setMovesLeft(TURN_ACTIONS);
+          turnsRef.current = 1;
+          setTurns(1);
           setSelected(null);
           setWinner(null);
           setFlashIndex(null);
@@ -1299,6 +1773,7 @@ export default function Page() {
             nextIndex: 0,
             currentPlayer: 1,
             movesLeft: TURN_ACTIONS,
+            turns: 1,
             winner: null,
             startingPlayer: 1,
             actionDeadlineMs: deadline,
@@ -1312,9 +1787,17 @@ export default function Page() {
     setTarget(appliedTarget);
     setMode(appliedMode);
     setCpuDifficulty(appliedDifficulty);
+    setMatchType(null);
+    hasFetchedRatesForMatchRef.current = false;
+    hasPersistedMatchRef.current = false;
+    setRateLoading(false);
+    setPlayerRate(1500);
+    setOpponentRate(1500);
     setStartingPlayer(first);
     setCurrentPlayer(first);
     setMovesLeft(TURN_ACTIONS);
+    turnsRef.current = 1;
+    setTurns(1);
     const rolled = rollFairInitialState(appliedTarget);
     const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
     setBoard(rolled.board);
@@ -1358,7 +1841,16 @@ export default function Page() {
     void leaveMatchChannel();
     void leaveOnlineRoom();
     setOnlineOpponentName("");
+    setOnlineOpponentUserId("");
     setOnlineBotFallback(false);
+    setMatchType(null);
+    setRateLoading(false);
+    setPlayerRate(1500);
+    setOpponentRate(1500);
+    setBotDisplayedOpponentRate(1500);
+    botDisplayGeneratedRef.current = false;
+    setResultRateChange(null);
+    setResultRateNonce((n) => n + 1);
     setScreen("menu");
   }
 
@@ -1405,6 +1897,7 @@ export default function Page() {
         nextIndex: 0,
         currentPlayer: startingPlayer,
         movesLeft: TURN_ACTIONS,
+        turns: turnsRef.current,
         winner: null,
         startingPlayer,
         actionDeadlineMs: deadline,
@@ -1451,6 +1944,7 @@ export default function Page() {
         nextIndex: nextIndexRef.current,
         currentPlayer: opponent,
         movesLeft: 0,
+        turns: turnsRef.current,
         winner: opponent,
         startingPlayer,
         actionDeadlineMs: null,
@@ -1512,6 +2006,172 @@ export default function Page() {
     playSe(isGod ? "godwin" : "win");
   }, [winner]);
 
+  /**
+   * 勝敗が確定したタイミングで、対戦履歴を保存し、条件に応じて Elo を更新します。
+   *
+   * 注意:
+   * - オンライン対戦はホスト側だけが INSERT/UPDATE を行うようにしています（重複保存防止）。
+   * - Elo は `match_type === "random"` のときだけ更新します。
+   * - CPU 対戦（ローカルCPU含む）も stats 用に match_history を保存します（Elo更新なし）。
+   */
+  useEffect(() => {
+    if (!winner) return;
+    if (hasPersistedMatchRef.current) return;
+    if (screen !== "play") return;
+
+    // 同じ勝利イベントで二重保存しない
+    hasPersistedMatchRef.current = true;
+
+    void (async () => {
+      const myUserId = getClientId();
+      const turnsUsed = turnsRef.current;
+      const turnsToGoal25 = turnsToGoal25Ref.current;
+
+      const modeNow = modeRef.current;
+
+      // オンライン対戦では DB の Elo 更新はホストだけが行います。
+      // ただし、ゲスト側も「リザルトでレート変動」を表示できるよう、
+      // 結果時に DB の現在レートを取り直して差分を作ります（保存/更新はしない）。
+      if (modeNow === "online" && online && online.role !== "host") {
+        const mt = matchTypeRef.current;
+        if (mt === "random" && onlineOpponentUserId) {
+          const beforeYour = playerRateRef.current;
+          const beforeOpp = opponentRateRef.current;
+          // ホストの UPDATE が完了する前にゲストが取得してしまうのを避けるため少し待つ
+          await new Promise((r) => setTimeout(r, 250));
+          const [afterYour, afterOpp] = await Promise.all([
+            getOrCreatePlayerRating(myUserId),
+            getOrCreatePlayerRating(onlineOpponentUserId),
+          ]);
+
+          setPlayerRate(afterYour);
+          setOpponentRate(afterOpp);
+          setResultRateChange({
+            yourBefore: beforeYour,
+            yourAfter: afterYour,
+            opponentBefore: beforeOpp,
+            opponentAfter: afterOpp,
+            yourDelta: afterYour - beforeYour,
+            opponentDelta: afterOpp - beforeOpp,
+          });
+          setResultRateNonce((n) => n + 1);
+        }
+        return;
+      }
+
+      // match_type を DB 用に確定します。
+      // - online: matchTypeRef は "random" / "room" のいずれか
+      // - cpu: matchTypeRef が "random" の場合は疑似オンライン（Elo対象）
+      //        それ以外は cpu_easy/normal/hard/god
+      let dbMatchType: MatchHistoryInsert["match_type"];
+      let player1Id = myUserId;
+      let player2Id = "";
+      let winnerId = "";
+
+      // Elo更新に使う「相手 userId」（random疑似オンラインのときに必要）
+      let opponentUserIdForElo = "";
+
+      try {
+        if (modeNow === "online") {
+          // online はホストだけが DB へ書き込み
+          if (!online || online.role !== "host") return;
+
+          const mt = matchTypeRef.current;
+          if (mt !== "random" && mt !== "room") return;
+          dbMatchType = mt;
+
+          if (!onlineOpponentUserId) return;
+          opponentUserIdForElo = onlineOpponentUserId;
+
+          const localIsPlayer1 = online.player === 1;
+          player1Id = localIsPlayer1 ? myUserId : onlineOpponentUserId;
+          player2Id = localIsPlayer1 ? onlineOpponentUserId : myUserId;
+          winnerId = winner === 1 ? player1Id : player2Id;
+        } else if (modeNow === "cpu") {
+          // CPU はローカルのため Elo なし。ただし random 疑似オンラインだけ例外で Elo 更新する。
+          const mt = matchTypeRef.current;
+
+          if (mt === "random") {
+            if (!onlineOpponentUserId) return;
+            dbMatchType = "random";
+            opponentUserIdForElo = onlineOpponentUserId;
+            player1Id = myUserId; // CPUゲームでは player1 が人間側
+            player2Id = onlineOpponentUserId; // player2 が BOT 側
+            winnerId = winner === 1 ? player1Id : player2Id;
+          } else {
+            // 通常CPU（Easy/Normal/Hard/God）
+            const d = cpuDifficultyRef.current;
+            dbMatchType =
+              d === "easy" ? "cpu_easy" : d === "normal" ? "cpu_normal" : d === "hard" ? "cpu_hard" : "cpu_god";
+            // 人間側 = player1、CPU側 = player2
+            player1Id = myUserId;
+            player2Id = `cpu_bot_${d}`; // stats集計用の疑似ユーザー
+            winnerId = winner === 1 ? player1Id : player2Id;
+          }
+        } else {
+          // local 対戦は stats の対象外（必要なら追加してください）
+          return;
+        }
+
+        // 1) 対戦履歴は必ず保存（stats 可視化のため）
+        try {
+          await insertMatchHistory({
+            player1_id: player1Id,
+            player2_id: player2Id,
+            winner_id: winnerId,
+            turns: turnsUsed,
+            match_type: dbMatchType,
+            // DBに列が無い可能性があるため、未達ならキー自体を送らない（undefined）
+            turns_to_goal25: turnsToGoal25 ?? undefined,
+            created_at: new Date().toISOString(),
+          });
+        } catch (err) {
+          // DB列追加漏れなどで保存できなくてもゲームは止めないが、原因特定のためログは出す
+          console.error("[match_history insert (inner) failed]", err);
+        }
+
+        // 2) Elo 更新は match_type が random のときのみ
+        if (dbMatchType !== "random") return;
+
+        const rating1 = await getOrCreatePlayerRating(player1Id);
+        const rating2 = await getOrCreatePlayerRating(player2Id);
+
+        const winnerSide: "A" | "B" = winner === 1 ? "A" : "B";
+        const { newRatingA, newRatingB } = calcEloAfterMatch({
+          ratingA: rating1,
+          ratingB: rating2,
+          winner: winnerSide,
+        });
+
+        // リザルト画面用：変動前→変動後（あなた/相手両方）を保持
+        const yourBefore = myUserId === player1Id ? rating1 : rating2;
+        const yourAfter = myUserId === player1Id ? newRatingA : newRatingB;
+        const opponentBefore = myUserId === player1Id ? rating2 : rating1;
+        const opponentAfter = myUserId === player1Id ? newRatingB : newRatingA;
+        setResultRateChange({
+          yourBefore,
+          yourAfter,
+          opponentBefore,
+          opponentAfter,
+          yourDelta: yourAfter - yourBefore,
+          opponentDelta: opponentAfter - opponentBefore,
+        });
+        setResultRateNonce((n) => n + 1);
+
+        await Promise.all([upsertPlayerRating(player1Id, newRatingA), upsertPlayerRating(player2Id, newRatingB)]);
+
+        // 自分側のレート状態も更新（random時だけ UI に反映されているため）
+        if (myUserId === player1Id) setPlayerRate(newRatingA);
+        if (myUserId === player2Id) setPlayerRate(newRatingB);
+        if (opponentUserIdForElo === player1Id) setOpponentRate(newRatingA);
+        if (opponentUserIdForElo === player2Id) setOpponentRate(newRatingB);
+      } catch (err) {
+        console.error("[match persistence failed]", err);
+        // DBエラーでもゲーム進行を止めない
+      }
+    })();
+  }, [winner, screen, onlineOpponentUserId, online]);
+
   function bumpForChanges(prev: number[], next: number[]) {
     setBumpIds((ids) => ids.map((id, i) => (prev[i] === next[i] ? id : id + 1)));
   }
@@ -1520,6 +2180,9 @@ export default function Page() {
     if (didWin) return;
     const after = Math.max(0, movesLeftRef.current - 1);
     if (after === 0) {
+      // 3アクション（= 1ターン）消化。次のプレイヤーへターンが進むので turns を +1。
+      turnsRef.current += 1;
+      setTurns(turnsRef.current);
       setMovesLeft(TURN_ACTIONS);
       setCurrentPlayer((p) => (p === 1 ? 2 : 1));
     } else {
@@ -1532,6 +2195,9 @@ export default function Page() {
     if (movesLeftRef.current === TURN_ACTIONS) return; // prevent accidental skip before doing anything
     cpuPlannedLineRef.current = null;
 
+    // 手動でターンを終了するので turns を +1
+    turnsRef.current += 1;
+    setTurns(turnsRef.current);
     setMovesLeft(TURN_ACTIONS);
     setCurrentPlayer((p) => (p === 1 ? 2 : 1));
 
@@ -1549,6 +2215,7 @@ export default function Page() {
         nextIndex: nextIndexRef.current,
         currentPlayer: nextPlayer,
         movesLeft: TURN_ACTIONS,
+        turns: turnsRef.current,
         winner: null,
         startingPlayer,
         actionDeadlineMs: newDeadline,
@@ -1609,6 +2276,7 @@ export default function Page() {
         nextIndex: idx,
         currentPlayer: nextPlayer,
         movesLeft: movesLeftNext,
+        turns: turnsRef.current,
         winner: didWin ? currentPlayerRef.current : null,
         startingPlayer,
         actionDeadlineMs: newDeadline,
@@ -1805,7 +2473,9 @@ export default function Page() {
     if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
 
     setCpuThinking(true);
-    const randomDelayMs = 1500 + Math.floor(Math.random() * 2501); // 1500-4000ms
+    // Humanize（長い思考時間）は「ランダムマッチのBOT」だけに限定する
+    const isRandomBot = onlineBotFallback && matchTypeRef.current === "random";
+    const delayMs = isRandomBot ? 1500 + Math.floor(Math.random() * 2501) : 500;
     cpuTimeoutRef.current = window.setTimeout(() => {
       setCpuThinking(false);
       if (modeRef.current !== "cpu") return;
@@ -1819,7 +2489,7 @@ export default function Page() {
 
       setSelected(null);
       startMove(planned.from, planned.to);
-    }, randomDelayMs);
+    }, delayMs);
 
     return () => {
       if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
@@ -1827,7 +2497,7 @@ export default function Page() {
       setCpuThinking(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isCpuTurn, isAnimatingMove, movesLeft, board, nextNumber, nextIndex, cpuDifficulty]);
+  }, [isCpuTurn, isAnimatingMove, movesLeft, board, nextNumber, nextIndex, cpuDifficulty, onlineBotFallback]);
 
   useEffect(() => {
     if (mode !== "cpu" || currentPlayer !== 2) cpuPlannedLineRef.current = null;
@@ -1967,6 +2637,18 @@ export default function Page() {
                 >
                   設定
                 </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void startBgm();
+                    playSe("susumu");
+                    setStatsRefreshNonce((n) => n + 1);
+                    setScreen("stats");
+                  }}
+                  className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  戦績
+                </button>
               </div>
             </div>
           </motion.div>
@@ -2037,6 +2719,93 @@ export default function Page() {
                   戻る
                 </button>
               </div>
+            </div>
+          </motion.div>
+        ) : screen === "stats" ? (
+          <motion.div
+            key="stats"
+            className="w-full"
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+          >
+            <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+              <header className="flex items-center justify-between gap-3">
+                <div className="space-y-1 text-left">
+                  <div className="text-xs font-black tracking-[0.25em] text-zinc-500">STATS</div>
+                  <div className="text-3xl font-black tracking-tight text-zinc-900">戦績</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    playSe("modoru");
+                    setScreen("title");
+                  }}
+                  className="rounded-2xl border border-white/70 bg-white/85 px-4 py-2 text-xs font-black text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  戻る
+                </button>
+              </header>
+
+              {statsLoading && (
+                <div className="rounded-[28px] border border-white/70 bg-white/75 px-6 py-8 text-center text-sm font-black text-zinc-700">
+                  読み込み中...
+                </div>
+              )}
+
+              {!statsLoading && statsError && (
+                <div className="rounded-[28px] border border-rose-200 bg-rose-50 px-6 py-8 text-center text-sm font-black text-rose-900">
+                  {statsError}
+                </div>
+              )}
+
+              {!statsLoading && statsPayload && (
+                <>
+                  {!statsPayload.hasAnyHistory ? (
+                    <div className="rounded-[28px] border border-emerald-200 bg-emerald-50 px-6 py-8 text-center text-sm font-black text-emerald-900">
+                      まだデータがありません。たくさん遊んで記録を残そう！
+                    </div>
+                  ) : (
+                    <div className="grid w-full gap-4 md:grid-cols-2">
+                      <div className="rounded-[28px] border border-sky-200 bg-sky-50 px-5 py-5 text-left">
+                        <div className="text-xs font-black tracking-[0.25em] text-sky-700/90">A. オンライン</div>
+                        <div className="mt-2 text-sm font-black text-zinc-900">現在のレート: {statsPayload.currentRate}</div>
+                        <div className="mt-1 text-sm font-black text-zinc-900">
+                          通算試合数: {statsPayload.onlineMatches} / 勝率:{" "}
+                          {statsPayload.onlineWinRate === null ? "-" : `${statsPayload.onlineWinRate}%`}
+                        </div>
+                        <div className="mt-2 text-xs font-semibold text-sky-900/80">
+                          Wins: {statsPayload.onlineWins}
+                        </div>
+                      </div>
+
+                      <div className="rounded-[28px] border border-emerald-200 bg-emerald-50 px-5 py-5 text-left">
+                        <div className="text-xs font-black tracking-[0.25em] text-emerald-700/90">B. CPU</div>
+                        <div className="mt-2 space-y-1 text-sm font-black text-zinc-900">
+                          <div>Easy: {statsPayload.cpuWins.easy}</div>
+                          <div>Normal: {statsPayload.cpuWins.normal}</div>
+                          <div>Hard: {statsPayload.cpuWins.hard}</div>
+                          <div>God: {statsPayload.cpuWins.god}</div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-[28px] border border-fuchsia-200 bg-fuchsia-50 px-5 py-5 text-left md:col-span-2">
+                        <div className="text-xs font-black tracking-[0.25em] text-fuchsia-700/90">C. プレイスタイル</div>
+                        <div className="mt-3 flex flex-wrap items-center gap-3">
+                          <div className="rounded-[999px] border border-white/70 bg-white/75 px-4 py-2 text-sm font-black text-zinc-900">
+                            25を作るまでの平均ターン:{" "}
+                            {statsPayload.avgTurnsToGoal25 === null ? "-" : `${statsPayload.avgTurnsToGoal25}ターン`}
+                          </div>
+                          <div className="rounded-[999px] border border-white/70 bg-white/75 px-4 py-2 text-sm font-black text-zinc-900">
+                            最大連勝数: {statsPayload.maxWinStreak}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </motion.div>
         ) : screen === "menu" ? (
@@ -2448,6 +3217,17 @@ export default function Page() {
                 相手: {onlineRoleLabel.oppText}
               </div>
             </div>
+
+            {matchType === "random" && (
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                  {playerName} (Rate: {playerRate})
+                </div>
+                <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                  {onlineOpponentName || "Opponent"} (Rate: {opponentRateForDisplay})
+                </div>
+              </div>
+            )}
             <motion.div
               className="h-3 w-64 overflow-hidden rounded-full border border-white/70 bg-white/80"
               initial={false}
@@ -2477,14 +3257,22 @@ export default function Page() {
                   <div className="text-2xl font-black tracking-tight sm:text-3xl md:text-4xl">{statusText}</div>
                   {isOnlineBattle && (
                     <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                      {playerName} vs {onlineOpponentName || "Opponent"}
+                      {matchType === "random"
+                        ? `${playerName} (Rate: ${playerRate}) vs ${
+                            onlineOpponentName || "Opponent"
+                          } (Rate: ${opponentRateForDisplay})`
+                        : `${playerName} vs ${onlineOpponentName || "Opponent"}`}
                     </div>
                   )}
-                  {showThinking && (
-                    <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                  {/* レイアウトシフト防止のため、表示/非表示でも高さを固定 */}
+                  <div className="min-h-[28px]">
+                    <div
+                      className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]"
+                      style={{ visibility: showThinking ? "visible" : "hidden" }}
+                    >
                       相手が考え中...
                     </div>
-                  )}
+                  </div>
                   {!winner && (
                     <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
                       {movesLeftText}
@@ -2524,18 +3312,19 @@ export default function Page() {
                     />
                   </div>
                 )}
-                {cpuFallbackMessage && (
+                {/* レイアウトシフト防止：表示/非表示でも高さ固定 */}
+                <div className="min-h-[46px] flex items-center">
                   <motion.div
                     key="cpu-fallback"
-                    initial={{ opacity: 0, y: 6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 6 }}
+                    initial={false}
+                    animate={{ opacity: cpuFallbackMessage ? 1 : 0, y: cpuFallbackMessage ? 0 : 6 }}
                     transition={{ duration: 0.2 }}
+                    style={{ visibility: cpuFallbackMessage ? "visible" : "hidden" }}
                     className="rounded-[18px] border border-emerald-200/80 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-900 shadow-[0_14px_30px_rgba(16,185,129,.10)]"
                   >
-                    {cpuFallbackMessage}
+                    {cpuFallbackMessage ?? "対戦相手が見つかりました！"}
                   </motion.div>
-                )}
+                </div>
                 <div className="text-sm font-semibold text-zinc-600 md:text-base">
                   隣接する2マスをタップして合体。合計が{" "}
                   <span className="inline-flex items-baseline gap-1 rounded-[999px] border border-white/70 bg-white/80 px-3 py-1 font-black text-zinc-900 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
@@ -3084,6 +3873,41 @@ export default function Page() {
                   <div className="mt-4 inline-flex items-center gap-2 rounded-[999px] border border-white/70 bg-white/80 px-4 py-2 text-sm font-black text-zinc-800 shadow-[0_18px_34px_rgba(90,60,160,.14)]">
                     <Icon name="lock" className="h-5 w-5" />
                     {unlockMessage}
+                  </div>
+                )}
+
+                {matchType === "random" && resultRateChange && (
+                  <div className="mt-4 w-full rounded-[20px] border border-white/70 bg-white/80 px-5 py-4 shadow-[0_18px_34px_rgba(90,60,160,.12)]">
+                    <div className="text-xs font-black tracking-[0.25em] text-zinc-600">RATE CHANGE</div>
+                    <div className="mt-2 flex flex-col gap-2">
+                      <motion.div
+                        key={resultRateNonce}
+                        initial={{ opacity: 0, y: 8, scale: 0.98 }}
+                        animate={{
+                          opacity: 1,
+                          y: 0,
+                          scale: 1,
+                        }}
+                        transition={{ type: "spring", stiffness: 520, damping: 28 }}
+                        className={[
+                          "rounded-[16px] border px-4 py-3 text-sm font-black",
+                          resultRateChange.yourDelta >= 0
+                            ? "border-emerald-200/80 bg-emerald-50 text-emerald-900"
+                            : "border-rose-200/80 bg-rose-50 text-rose-900",
+                        ].join(" ")}
+                      >
+                        Rate: {resultRateChange.yourBefore} ➔ {resultRateChange.yourAfter} (
+                        {resultRateChange.yourDelta >= 0 ? `+${resultRateChange.yourDelta}` : resultRateChange.yourDelta})
+                      </motion.div>
+
+                      <div className="rounded-[16px] border border-white/70 bg-white/70 px-4 py-3 text-sm font-black text-zinc-900">
+                        Opponent: {resultRateChange.opponentBefore} ➔ {resultRateChange.opponentAfter} (
+                        {resultRateChange.opponentDelta >= 0
+                          ? `+${resultRateChange.opponentDelta}`
+                          : resultRateChange.opponentDelta}
+                        )
+                      </div>
+                    </div>
                   </div>
                 )}
 
