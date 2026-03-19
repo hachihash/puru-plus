@@ -4491,7 +4491,10 @@ export default function Page() {
                 <div className="mt-6 flex flex-wrap justify-center gap-3">
                   <motion.button
                     type="button"
-                    onClick={backToMenu}
+                    onClick={() => {
+                      // iPhoneの重さを解消するため、メモリを一度完全にクリアして遷移させる
+                      window.location.href = '/mode-selection';
+                    }}
                     className="rounded-3xl bg-gradient-to-r from-amber-400 to-yellow-300 px-6 py-3 text-sm font-black text-zinc-900 shadow-[0_18px_30px_rgba(120,70,40,.22)] transition-transform hover:brightness-105 active:scale-[0.98]"
                     whileHover={{ y: -1 }}
                     whileTap={{ scale: 0.98 }}
