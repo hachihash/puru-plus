@@ -2925,7 +2925,7 @@ export default function Page() {
   }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode, pendingWinner]);
 
   return (
-    <main className="h-[100dvh] max-h-screen overflow-hidden pb-[env(safe-area-inset-bottom)] text-zinc-900">
+    <main className="h-[100dvh] flex flex-col max-h-screen overflow-hidden pb-[env(safe-area-inset-bottom)] text-zinc-900">
       {/* Gooey (slime/water merge) effect */}
       <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
         <defs>
@@ -3229,11 +3229,11 @@ export default function Page() {
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-4 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
-              <header className="space-y-1">
+            <div className="flex h-full min-h-0 flex-col gap-3 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
+              <header className="space-y-1 flex-shrink-0">
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <motion.div
-                  className="text-4xl font-black tracking-tight md:text-5xl"
+                  className="text-[clamp(1.8rem,8vw,3rem)] font-black tracking-tight"
                   initial={{ scale: 0.9, y: 6, rotate: -1, opacity: 0 }}
                   animate={{
                     scale: [1, 1.03, 1],
@@ -3265,8 +3265,8 @@ export default function Page() {
                     ぷるぷらす
                   </span>
                 </motion.div>
-                <div className="text-3xl font-black tracking-tight md:text-4xl">モード選択</div>
-                <div className="text-sm font-semibold text-zinc-600 md:text-base">
+                <div className="text-2xl font-black tracking-tight md:text-4xl">モード選択</div>
+                <div className="text-xs font-semibold text-zinc-600 md:text-base">
                   スワイプ or クリックで合体。ぴったり {menuTarget} を狙おう！
                 </div>
                 <div className="flex justify-end">
@@ -3283,7 +3283,7 @@ export default function Page() {
                 </div>
               </header>
 
-              <div className="grid gap-3 md:grid-cols-2">
+              <div className="grid flex-grow gap-2 overflow-y-auto pr-1 md:grid-cols-2">
                 <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-xs font-black tracking-widest text-zinc-700">対戦モード</div>
@@ -3531,26 +3531,23 @@ export default function Page() {
                 )}
               </div>
 
-              <div className="flex flex-wrap gap-3">
+              <div className="mt-auto flex flex-col gap-2 pb-[env(safe-area-inset-bottom)] p-4">
                 <button
                   type="button"
                   onClick={startRandomMatch}
-                  className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  className="w-full whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-3 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
                 >
                   レートマッチ
                 </button>
-              </div>
-              <div className="text-xs font-semibold text-zinc-600">
-                勝敗に応じてレートが変動するオンライン対戦モードです
-              </div>
-
-              <div className="flex flex-wrap gap-3">
+                <div className="text-center text-xs font-semibold text-zinc-600">
+                  勝敗に応じてレートが変動するオンライン対戦モードです
+                </div>
                 <button
                   type="button"
                   onClick={startGame}
-                  className="flex-1 whitespace-nowrap rounded-[28px] bg-gradient-to-r from-emerald-400 to-cyan-400 px-6 py-4 text-base font-extrabold text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  className="w-full whitespace-nowrap rounded-[28px] bg-gradient-to-r from-emerald-400 to-cyan-400 px-6 py-3 text-base font-extrabold text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
                 >
-                  スタート
+                  ゲームスタート
                 </button>
               </div>
             </div>
