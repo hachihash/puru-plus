@@ -813,6 +813,7 @@ export default function Page() {
 
   const [bgmMuted, setBgmMuted] = useState<boolean>(false);
   const [seMuted, setSeMuted] = useState<boolean>(false);
+  const [isIOSSafari, setIsIOSSafari] = useState<boolean>(false);
 
   // Active game settings
   const [target, setTarget] = useState<number>(DEFAULT_TARGET);
@@ -957,6 +958,15 @@ export default function Page() {
   useEffect(() => {
     timeLimitMsRef.current = timeLimitMs;
   }, [timeLimitMs]);
+
+  useEffect(() => {
+    // iPhone Safari 判定（重い視覚効果のフォールバック用）
+    if (typeof navigator === "undefined") return;
+    const ua = navigator.userAgent;
+    const isIOS = /iP(hone|ad|od)/.test(ua);
+    const isSafari = /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/.test(ua);
+    setIsIOSSafari(isIOS && isSafari);
+  }, []);
 
   useEffect(() => {
     // Restore mute settings
@@ -2295,6 +2305,31 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [winner]);
 
+  useEffect(() => {
+    // 終局時は不要な進行処理を明示的に停止して、iPhone の負荷を下げる
+    if (!winner) return;
+    if (cpuTimeoutRef.current) {
+      window.clearTimeout(cpuTimeoutRef.current);
+      cpuTimeoutRef.current = null;
+    }
+    setCpuThinking(false);
+    setSelected(null);
+    setIsProcessing(false);
+    isProcessingRef.current = false;
+    setMoveOverlay(null);
+    setIsAnimatingMove(false);
+  }, [winner]);
+
+  useEffect(() => {
+    // リザルト表示中は AudioContext を suspend して無駄なCPU消費を抑える
+    if (!winner || !resultModalReady) return;
+    const ctx = audioCtxRef.current;
+    if (!ctx || ctx.state !== "running") return;
+    void ctx.suspend().catch(() => {
+      // ignore
+    });
+  }, [winner, resultModalReady]);
+
   /**
    * 勝敗が確定したタイミングで、対戦履歴を保存し、条件に応じて Elo を更新します。
    *
@@ -2973,7 +3008,7 @@ export default function Page() {
           <motion.div
             key={i}
             className="absolute"
-            style={{ left: b.left, top: b.top, width: b.size, height: b.size, opacity: 0.42 }}
+            style={{ left: b.left, top: b.top, width: b.size, height: b.size, opacity: 0.42, willChange: "transform" }}
             animate={{
               y: [0, -30, 0],
               rotate: [0, 180, 360],
@@ -3668,7 +3703,13 @@ export default function Page() {
           exit={{ opacity: 0, y: -10, scale: 0.98 }}
           transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
         >
-          <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-6">
+          <div
+            className={[
+              "flex flex-col gap-4 rounded-[36px] border border-white/70 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] md:gap-6 md:rounded-[40px] md:p-6",
+              isIOSSafari ? "bg-white/90" : "bg-gradient-to-b from-white/75 to-white/55 backdrop-blur",
+            ].join(" ")}
+            style={{ willChange: "transform" }}
+          >
             <header className="flex flex-shrink-0 flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
               <div className="space-y-2">
                 <div className="flex w-full items-center justify-between gap-3">
@@ -3878,8 +3919,9 @@ export default function Page() {
                   </div>
                 )}
 
-                {/* GameCoreUnit: モバイルは縦並び、sm以上は盤面とNEXTを横並び */}
-                <div className="flex w-full max-w-[560px] flex-col items-center gap-3 sm:flex-row sm:items-start sm:justify-center">
+                {/* GameCoreUnit: 盤面 + NEXT を常に中央寄せ、sm以上は横並び */}
+                <div className="flex w-full items-center justify-center">
+                  <div className="flex w-full max-w-[560px] flex-col items-center justify-center gap-4 sm:flex-row sm:items-center sm:justify-center sm:gap-8">
                   <div className="w-full max-w-sm rounded-3xl border border-white/70 bg-white/72 p-3 shadow-[0_16px_34px_rgba(90,60,160,.12)] sm:order-2 sm:w-[170px] sm:max-w-none">
                     <div className="flex items-end justify-between gap-3 sm:flex-col sm:items-start">
                       <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
@@ -3895,7 +3937,7 @@ export default function Page() {
                     </div>
                   </div>
 
-                  <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1 sm:flex-1">
+                  <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1">
                 <div className="relative aspect-square w-[min(100%,60dvh)] touch-none overscroll-contain sm:w-full sm:max-w-[460px]" ref={boardWrapRef}>
                   <div className="grid grid-cols-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-3 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-4">
                     {board.map((value, idx) => {
@@ -4098,6 +4140,7 @@ export default function Page() {
                       </>
                     )}
                   </AnimatePresence>
+                </div>
                 </div>
                 </div>
                 </div>
