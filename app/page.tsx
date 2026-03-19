@@ -3260,13 +3260,13 @@ export default function Page() {
         ) : screen === "menu" ? (
           <motion.div
             key="menu"
-            className="w-full min-h-[100dvh] overflow-y-auto pb-10"
+            className="w-full min-h-[100dvh] overflow-y-auto py-4 pb-10"
             initial={{ opacity: 0, y: 10, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col gap-3 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
+            <div className="mx-auto flex w-full max-w-[min(90vw,400px)] flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
               <header className="space-y-1 flex-shrink-0">
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <motion.div
@@ -3699,7 +3699,7 @@ export default function Page() {
       ) : (
         <motion.div
           key="play"
-          className="w-full min-h-[100dvh] overflow-y-auto pb-20 pb-[env(safe-area-inset-bottom)]"
+          className="w-full min-h-[100dvh] overflow-y-auto py-4 pb-20 pb-[env(safe-area-inset-bottom)]"
           initial={{ opacity: 0, y: 10, scale: 0.98 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -10, scale: 0.98 }}
@@ -3707,12 +3707,12 @@ export default function Page() {
         >
           <div
             className={[
-              "flex flex-col gap-4 rounded-[36px] border border-white/70 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] md:gap-6 md:rounded-[40px] md:p-6",
+              "mx-auto flex w-full max-w-[min(90vw,400px)] flex-col gap-4 rounded-[36px] border border-white/70 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] md:gap-6 md:rounded-[40px] md:p-6",
               isIOSSafari ? "bg-white/90" : "bg-gradient-to-b from-white/75 to-white/55 backdrop-blur",
             ].join(" ")}
             style={{ willChange: "transform" }}
           >
-            <header className="flex flex-shrink-0 flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <header className="flex flex-shrink-0 flex-col gap-4 sm:flex-row sm:items-end sm:justify-center">
               <div className="space-y-2">
                 <div className="flex w-full items-center justify-between gap-3">
                   <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
@@ -3901,7 +3901,7 @@ export default function Page() {
             </header>
 
             <section className="flex w-full flex-col items-center gap-4 md:gap-5">
-              <div className="flex w-full max-w-[560px] flex-col items-center gap-3">
+              <div className="flex w-full max-w-[min(90vw,400px)] flex-col items-center gap-3">
                 {!winner && (
                   <div className="w-full max-w-sm">
                     <div className="relative h-12 rounded-[999px] border border-white/70 bg-white/75 p-1 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_18px_30px_rgba(90,60,160,.12)]">
@@ -3923,7 +3923,7 @@ export default function Page() {
 
                 {/* GameCoreUnit: 盤面 + NEXT を常に中央寄せ、sm以上は横並び */}
                 <div className="flex w-full items-center justify-center">
-                  <div className="flex w-full max-w-[560px] flex-col items-center justify-center gap-4 sm:flex-row sm:items-center sm:justify-center sm:gap-8">
+                  <div className="flex w-full max-w-[min(90vw,400px)] flex-col items-center justify-center gap-4 sm:flex-row sm:items-center sm:justify-center sm:gap-6">
                   <div className="w-full max-w-sm rounded-3xl border border-white/70 bg-white/72 p-3 shadow-[0_16px_34px_rgba(90,60,160,.12)] sm:order-2 sm:w-[170px] sm:max-w-none">
                     <div className="flex items-end justify-between gap-3 sm:flex-col sm:items-start">
                       <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
@@ -3941,7 +3941,7 @@ export default function Page() {
 
                   <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1">
                 <div className="relative mx-auto aspect-square w-full max-w-[400px] touch-none overscroll-contain" ref={boardWrapRef}>
-                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-6 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-8">
+                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 gap-2 rounded-[36px] border border-white/70 bg-white/65 p-2 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-3 md:rounded-[44px] md:p-4">
                     {board.map((value, idx) => {
                       const isSelected = selected === idx;
                       const isFlashing = flashIndex === idx;
@@ -4162,7 +4162,7 @@ export default function Page() {
 
               </div>
 
-              <aside className="mt-2 flex w-full max-w-[560px] flex-col items-center gap-4">
+              <aside className="mt-2 flex w-full max-w-[min(90vw,400px)] flex-col items-center gap-4">
                 <div className="flex w-full flex-wrap items-center justify-center gap-3 md:justify-start">
                   {!isOnlineBattle ? (
                     <>
@@ -4176,8 +4176,17 @@ export default function Page() {
 
                       <button
                         type="button"
-                        onClick={backToMenu}
-                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                        onClick={() => {
+                          // 1. 効果音を鳴らす
+                          playSe("modoru");
+                        
+                          // 2. 通信やタイマーを即座に停止（もしあれば）
+                          // stopAllProcess(); 
+    
+                          // 3. 強制リロード遷移でメモリをクリア
+                          window.location.href = '/';
+                        }}
+                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3" // ここは元のクラス名のままでOK
                       >
                         モード選択へ
                       </button>
