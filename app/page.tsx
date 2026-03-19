@@ -2925,7 +2925,7 @@ export default function Page() {
   }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode, pendingWinner]);
 
   return (
-    <main className="h-[100dvh] max-h-screen overflow-hidden text-zinc-900">
+    <main className="h-[100dvh] max-h-screen overflow-hidden pb-[env(safe-area-inset-bottom)] text-zinc-900">
       {/* Gooey (slime/water merge) effect */}
       <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
         <defs>
@@ -2995,7 +2995,7 @@ export default function Page() {
           </motion.div>
         ))}
       </div>
-      <div className="relative z-10 mx-auto flex h-full max-h-full w-full max-w-4xl flex-col items-center overflow-hidden px-3 py-2 md:px-4 md:py-4">
+      <div className="relative z-10 mx-auto flex h-full max-h-full w-full max-w-4xl flex-col items-center overflow-hidden px-3 py-2 pb-[env(safe-area-inset-bottom)] md:px-4 md:py-4">
         <AnimatePresence mode="wait">
         {screen === "title" ? (
           <motion.div
@@ -3006,11 +3006,11 @@ export default function Page() {
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+            <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-5 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-7">
               <div>
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
-                <div className="mt-2 text-4xl font-black tracking-tight text-zinc-900 md:text-5xl">ぷるぷらす</div>
-                <div className="mt-2 text-sm font-semibold text-zinc-600">スワイプ or クリックで合体。ぴったりを狙おう！</div>
+                <div className="mt-1 text-[clamp(1.8rem,8vw,3rem)] font-black tracking-tight text-zinc-900">ぷるぷらす</div>
+                <div className="mt-1 text-xs font-semibold text-zinc-600 md:text-sm">スワイプ or クリックで合体。ぴったりを狙おう！</div>
               </div>
 
               <div className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2">
@@ -3065,13 +3065,13 @@ export default function Page() {
         ) : screen === "settings" ? (
           <motion.div
             key="settings"
-            className="w-full"
+            className="fixed inset-0 z-40 flex items-center justify-center px-4 py-4 pb-[env(safe-area-inset-bottom)]"
             initial={{ opacity: 0, y: 10, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+            <div className="flex max-h-full w-full max-w-2xl flex-col gap-5 overflow-y-auto rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-5 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-7">
               <div className="space-y-1">
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">SETTING</div>
                 <div className="text-3xl font-black tracking-tight text-zinc-900">音量設定</div>
@@ -3119,7 +3119,7 @@ export default function Page() {
                 </div>
               </div>
 
-              <div className="flex flex-wrap justify-center gap-3">
+              <div className="flex flex-wrap justify-center gap-3 pb-[env(safe-area-inset-bottom)]">
                 <button
                   type="button"
                   onClick={() => {
@@ -3537,8 +3537,11 @@ export default function Page() {
                   onClick={startRandomMatch}
                   className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
                 >
-                  ランダム対戦
+                  レートマッチ
                 </button>
+              </div>
+              <div className="text-xs font-semibold text-zinc-600">
+                勝敗に応じてレートが変動するオンライン対戦モードです
               </div>
 
               <div className="flex flex-wrap gap-3">
