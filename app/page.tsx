@@ -13,7 +13,7 @@ type CpuDifficulty = "easy" | "normal" | "hard" | "god";
 type TargetValue = number;
 type FirstTurn = "p1" | "p2" | "random";
 type Screen = "title" | "menu" | "settings" | "onlineWaiting" | "matching" | "play" | "stats";
-type TimeLimitChoice = "15" | "30" | "none";
+type TimeLimitChoice = "3" | "15" | "30" | "none";
 
 type OnlineRole = "host" | "guest";
 type OnlineState = {
@@ -521,6 +521,7 @@ export default function Page() {
   const [screen, setScreen] = useState<Screen>("title");
   const [isPaused, setIsPaused] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const matchingRunIdRef = useRef(0);
 
   const [unlockedDifficulties, setUnlockedDifficulties] = useState<CpuDifficulty[]>(["easy", "normal"]);
@@ -574,6 +575,7 @@ export default function Page() {
   // BOTレート偽装（表示だけを見せかける）
   const [botDisplayedOpponentRate, setBotDisplayedOpponentRate] = useState<number>(1500);
   const botDisplayGeneratedRef = useRef<boolean>(false);
+  const botFakeRateRef = useRef<number>(1500);
 
   // リザルト画面のレート変動表示（アニメーション用）
   const [resultRateChange, setResultRateChange] = useState<{
@@ -585,6 +587,8 @@ export default function Page() {
     opponentDelta: number;
   } | null>(null);
   const [resultRateNonce, setResultRateNonce] = useState(0);
+
+  const onlineBotFallbackRef = useRef<boolean>(false);
 
   // Online waiting (room ID sync)
   const [onlineWaitingRoomId, setOnlineWaitingRoomId] = useState<string>("");
@@ -613,20 +617,34 @@ export default function Page() {
   // Randomマッチ時にレーティングを取得してヘッダー表示に反映する
   useEffect(() => {
     if (matchType !== "random") return;
-    if (screen !== "play" && screen !== "onlineWaiting") return;
+    if (screen !== "play" && screen !== "onlineWaiting" && screen !== "matching") return;
+    const myUserId = getClientId();
+
+    // マッチング中は相手 userId がまだ無いので、自分のレートだけ先に取得して UI を確実に表示する
+    if (screen === "matching" && !onlineOpponentUserId) {
+      if (hasFetchedMyRateForMatchRef.current) return;
+      hasFetchedMyRateForMatchRef.current = true;
+      setRateLoading(true);
+      void (async () => {
+        try {
+          const myRate = await getOrCreatePlayerRating(myUserId);
+          setPlayerRate(myRate);
+        } finally {
+          setRateLoading(false);
+        }
+      })();
+      return;
+    }
+
     if (hasFetchedRatesForMatchRef.current) return;
     if (!onlineOpponentUserId) return; // online/ボット共通で相手 userId が必要
 
     hasFetchedRatesForMatchRef.current = true;
     setRateLoading(true);
     void (async () => {
-      const myUserId = getClientId();
       const oppUserId = onlineOpponentUserId;
       try {
-        const [myRate, oppRate] = await Promise.all([
-          getOrCreatePlayerRating(myUserId),
-          getOrCreatePlayerRating(oppUserId),
-        ]);
+        const [myRate, oppRate] = await Promise.all([getOrCreatePlayerRating(myUserId), getOrCreatePlayerRating(oppUserId)]);
         setPlayerRate(myRate);
         setOpponentRate(oppRate);
       } finally {
@@ -646,6 +664,9 @@ export default function Page() {
     const max = playerRate + 50;
     const fake = randInt(min, max);
     setBotDisplayedOpponentRate(fake);
+    // Elo計算にも偽装レートを使うため、state自体も反映する
+    setOpponentRate(fake);
+    botFakeRateRef.current = fake;
     botDisplayGeneratedRef.current = true;
   }, [onlineBotFallback, matchType, rateLoading, playerRate]);
 
@@ -741,8 +762,10 @@ export default function Page() {
         };
 
         // --- C. プレイスタイル ---
-        // 25 を作るまでのターン数（turns_to_goal25）が入っている試合だけ平均する
-        const turnsToGoal25Values = history
+        // 25 を作るまでのターン数（turns_to_goal25）が入っている試合だけ平均する。
+        // ただし「自分が勝利した試合（winner_id === 自身のユーザーID）」のみを対象にする。
+        const wonHistory = history.filter((r) => r.winner_id === userId);
+        const turnsToGoal25Values = wonHistory
           .map((r) => r.turns_to_goal25)
           .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
 
@@ -842,6 +865,7 @@ export default function Page() {
   const matchIdRef = useRef<number | null>(matchId);
   const isProcessingRef = useRef<boolean>(isProcessing);
   const hasFetchedRatesForMatchRef = useRef<boolean>(false);
+  const hasFetchedMyRateForMatchRef = useRef<boolean>(false);
   const hasPersistedMatchRef = useRef<boolean>(false);
   const playerRateRef = useRef<number>(playerRate);
   const opponentRateRef = useRef<number>(opponentRate);
@@ -881,6 +905,10 @@ export default function Page() {
   useEffect(() => {
     opponentRateRef.current = opponentRate;
   }, [opponentRate]);
+
+  useEffect(() => {
+    onlineBotFallbackRef.current = onlineBotFallback;
+  }, [onlineBotFallback]);
 
   useEffect(() => {
     // 新しいゲーム開始時（screen が play になった瞬間）に 25 記録をリセット
@@ -1128,11 +1156,6 @@ export default function Page() {
     return { myText, oppText };
   }, [menuOnlineRole]);
 
-  const statusText = useMemo(() => {
-    if (winner) return `${playerLabel(winner)} Wins!`;
-    return `${playerLabel(currentPlayer)} Turn`;
-  }, [currentPlayer, winner]);
-
   const movesLeftText = useMemo(() => {
     if (winner) return "";
     return `のこり手数：${movesLeft}`;
@@ -1147,6 +1170,7 @@ export default function Page() {
   const timeLeftSec = useMemo(() => (timeLeftMs === null ? null : Math.ceil(timeLeftMs / 1000)), [timeLeftMs]);
 
   function choiceToMs(choice: TimeLimitChoice): number | null {
+    if (choice === "3") return 3_000;
     if (choice === "15") return 15_000;
     if (choice === "30") return 30_000;
     return null;
@@ -1200,7 +1224,18 @@ export default function Page() {
 
     if (error) {
       // DBエラーがあってもゲーム自体は止めたくないので初期値で進行
-      console.error("[player_ratings select failed]", error, { userId });
+      const err = error as unknown as SupabaseErrorLike;
+      console.error(
+        "[player_ratings select failed]",
+        safeStringify({
+          message: err.message,
+          details: err.details,
+          hint: err.hint,
+          status: err.status,
+          code: err.code,
+        }),
+        { userId },
+      );
       return initialRating;
     }
 
@@ -1216,7 +1251,18 @@ export default function Page() {
       });
 
     if (upsertError) {
-      console.error("[player_ratings upsert failed]", upsertError, { userId, initialRating });
+      const err = upsertError as unknown as SupabaseErrorLike;
+      console.error(
+        "[player_ratings upsert failed]",
+        safeStringify({
+          message: err.message,
+          details: err.details,
+          hint: err.hint,
+          status: err.status,
+          code: err.code,
+        }),
+        { userId, initialRating },
+      );
       return initialRating;
     }
 
@@ -1235,7 +1281,18 @@ export default function Page() {
         onConflict: "user_id",
       });
     if (error) {
-      console.error("[player_ratings upsert failed]", error, { userId, newRating });
+      const err = error as unknown as SupabaseErrorLike;
+      console.error(
+        "[player_ratings upsert failed]",
+        safeStringify({
+          message: err.message,
+          details: err.details,
+          hint: err.hint,
+          status: err.status,
+          code: err.code,
+        }),
+        { userId, newRating },
+      );
       throw error;
     }
   }
@@ -1349,6 +1406,7 @@ export default function Page() {
     setMatchType("random");
     setCpuThinking(false);
     hasFetchedRatesForMatchRef.current = false;
+    hasFetchedMyRateForMatchRef.current = false;
     hasPersistedMatchRef.current = false;
     setRateLoading(true);
     setResultRateChange(null);
@@ -1845,6 +1903,7 @@ export default function Page() {
     setOnlineBotFallback(false);
     setMatchType(null);
     setRateLoading(false);
+    hasFetchedMyRateForMatchRef.current = false;
     setPlayerRate(1500);
     setOpponentRate(1500);
     setBotDisplayedOpponentRate(1500);
@@ -2134,7 +2193,11 @@ export default function Page() {
         if (dbMatchType !== "random") return;
 
         const rating1 = await getOrCreatePlayerRating(player1Id);
-        const rating2 = await getOrCreatePlayerRating(player2Id);
+        // BOT（疑似オンライン）だけ、対戦開始時に生成した偽装レートを Elo 基準にする
+        const rating2 =
+          modeNow === "cpu" && onlineBotFallbackRef.current
+            ? botFakeRateRef.current
+            : await getOrCreatePlayerRating(player2Id);
 
         const winnerSide: "A" | "B" = winner === 1 ? "A" : "B";
         const { newRatingA, newRatingB } = calcEloAfterMatch({
@@ -2985,6 +3048,7 @@ export default function Page() {
                   <div className="mt-2 flex flex-wrap gap-2">
                     {(
                       [
+                        { id: "3", label: "3秒" },
                         { id: "15", label: "15秒" },
                         { id: "30", label: "30秒" },
                         { id: "none", label: "制限なし" },
@@ -3159,6 +3223,9 @@ export default function Page() {
               <div className="text-xs font-black tracking-[0.25em] text-zinc-500">MATCHING</div>
               <div className="text-3xl font-black tracking-tight text-zinc-900">対戦相手を探しています...</div>
               <div className="text-sm font-semibold text-zinc-600">最大15秒ほどかかる場合があります</div>
+              <div className="text-sm font-semibold text-zinc-600">
+                Your Rate: {playerRate}
+              </div>
               <motion.div
                 className="h-3 w-64 overflow-hidden rounded-full border border-white/70 bg-white/80"
                 initial={false}
@@ -3252,231 +3319,190 @@ export default function Page() {
           <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-4 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-6">
             <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
               <div className="space-y-2">
-                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
-                <div className="flex flex-wrap items-baseline gap-3">
-                  <div className="text-2xl font-black tracking-tight sm:text-3xl md:text-4xl">{statusText}</div>
+                <div className="flex w-full items-center justify-between gap-3">
+                  <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
+                  <button
+                    type="button"
+                    onClick={() => setHelpOpen(true)}
+                    aria-label="ヘルプ"
+                    className="grid h-8 w-8 place-items-center rounded-full border border-white/70 bg-white/85 text-zinc-800 shadow-[0_14px_30px_rgba(80,60,130,.10)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  >
+                    <span className="text-xs font-black">?</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-col items-center gap-2">
                   {isOnlineBattle && (
                     <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
                       {matchType === "random"
-                        ? `${playerName} (Rate: ${playerRate}) vs ${
+                        ? `${playerName} (Rate: ${playerRate}) VS ${
                             onlineOpponentName || "Opponent"
                           } (Rate: ${opponentRateForDisplay})`
                         : `${playerName} vs ${onlineOpponentName || "Opponent"}`}
                     </div>
                   )}
-                  {/* レイアウトシフト防止のため、表示/非表示でも高さを固定 */}
-                  <div className="min-h-[28px]">
-                    <div
-                      className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]"
-                      style={{ visibility: showThinking ? "visible" : "hidden" }}
-                    >
-                      相手が考え中...
+
+                  <div className="flex flex-wrap items-baseline justify-center gap-3">
+                    {/* レイアウトシフト防止のため、表示/非表示でも高さを固定 */}
+                    <div className="min-h-[28px]">
+                      <div
+                        className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]"
+                        style={{ visibility: showThinking ? "visible" : "hidden" }}
+                      >
+                        相手が考え中...
+                      </div>
                     </div>
+
+                    {!winner && (
+                      <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                        {movesLeftText}
+                      </div>
+                    )}
+
+                    {!winner && (
+                      <motion.div
+                        className={[
+                          "rounded-[999px] border px-3 py-1 text-xs font-black shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]",
+                          timeLeftSec !== null && timeLeftSec <= 10
+                            ? "border-red-300 bg-red-50 text-red-700"
+                            : "border-white/70 bg-white/75 text-zinc-700",
+                        ].join(" ")}
+                        animate={timeLeftSec !== null && timeLeftSec <= 10 ? { x: [0, -2, 2, -2, 2, 0] } : { x: 0 }}
+                        transition={
+                          timeLeftSec !== null && timeLeftSec <= 10 ? { duration: 0.35, repeat: Infinity } : { duration: 0.2 }
+                        }
+                      >
+                        {timeLeftSec === null ? "∞" : `${timeLeftSec}s`}
+                      </motion.div>
+                    )}
                   </div>
+
                   {!winner && (
-                    <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                      {movesLeftText}
+                    <div className="h-3 w-full max-w-sm overflow-hidden rounded-full border border-white/70 bg-white/70">
+                      <motion.div
+                        className={
+                          timeLeftSec !== null && timeLeftSec <= 10
+                            ? "h-full bg-red-400"
+                            : "h-full bg-gradient-to-r from-emerald-300 to-cyan-300"
+                        }
+                        animate={{
+                          width: `${
+                            timeLeftMs === null || timeLimitMsRef.current === null
+                              ? 100
+                              : Math.min(100, Math.max(0, (timeLeftMs / timeLimitMsRef.current) * 100))
+                          }%`,
+                        }}
+                        transition={{ duration: 0.12, ease: "linear" }}
+                      />
                     </div>
                   )}
-                  {!winner && (
+
+                  {/* レイアウトシフト防止：表示/非表示でも高さ固定 */}
+                  <div className="min-h-[46px] flex items-center">
                     <motion.div
-                      className={[
-                        "rounded-[999px] border px-3 py-1 text-xs font-black shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]",
-                        timeLeftSec !== null && timeLeftSec <= 10
-                          ? "border-red-300 bg-red-50 text-red-700"
-                          : "border-white/70 bg-white/75 text-zinc-700",
-                      ].join(" ")}
-                      animate={timeLeftSec !== null && timeLeftSec <= 10 ? { x: [0, -2, 2, -2, 2, 0] } : { x: 0 }}
-                      transition={timeLeftSec !== null && timeLeftSec <= 10 ? { duration: 0.35, repeat: Infinity } : { duration: 0.2 }}
+                      key="cpu-fallback"
+                      initial={false}
+                      animate={{ opacity: cpuFallbackMessage ? 1 : 0, y: cpuFallbackMessage ? 0 : 6 }}
+                      transition={{ duration: 0.2 }}
+                      style={{ visibility: cpuFallbackMessage ? "visible" : "hidden" }}
+                      className="rounded-[18px] border border-emerald-200/80 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-900 shadow-[0_14px_30px_rgba(16,185,129,.10)]"
                     >
-                      {timeLeftSec === null ? "∞" : `${timeLeftSec}s`}
+                      {cpuFallbackMessage ?? "対戦相手が見つかりました！"}
                     </motion.div>
-                  )}
-                </div>
-                {!winner && (
-                  <div className="h-3 w-full max-w-sm overflow-hidden rounded-full border border-white/70 bg-white/70">
-                    <motion.div
-                      className={
-                        timeLeftSec !== null && timeLeftSec <= 10
-                          ? "h-full bg-red-400"
-                          : "h-full bg-gradient-to-r from-emerald-300 to-cyan-300"
-                      }
-                      animate={{
-                        width: `${
-                          timeLeftMs === null || timeLimitMsRef.current === null
-                            ? 100
-                            : Math.min(100, Math.max(0, (timeLeftMs / timeLimitMsRef.current) * 100))
-                        }%`,
-                      }}
-                      transition={{ duration: 0.12, ease: "linear" }}
-                    />
                   </div>
-                )}
-                {/* レイアウトシフト防止：表示/非表示でも高さ固定 */}
-                <div className="min-h-[46px] flex items-center">
-                  <motion.div
-                    key="cpu-fallback"
-                    initial={false}
-                    animate={{ opacity: cpuFallbackMessage ? 1 : 0, y: cpuFallbackMessage ? 0 : 6 }}
-                    transition={{ duration: 0.2 }}
-                    style={{ visibility: cpuFallbackMessage ? "visible" : "hidden" }}
-                    className="rounded-[18px] border border-emerald-200/80 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-900 shadow-[0_14px_30px_rgba(16,185,129,.10)]"
-                  >
-                    {cpuFallbackMessage ?? "対戦相手が見つかりました！"}
-                  </motion.div>
-                </div>
-                <div className="text-sm font-semibold text-zinc-600 md:text-base">
-                  隣接する2マスをタップして合体。合計が{" "}
-                  <span className="inline-flex items-baseline gap-1 rounded-[999px] border border-white/70 bg-white/80 px-3 py-1 font-black text-zinc-900 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                    <span className="text-[10px] font-black tracking-widest text-zinc-600">GOAL</span>
-                    <span className="text-xl font-black tabular-nums">{target}</span>
-                  </span>{" "}
-                  ぴったりで勝利！
+
+                  <div className="text-sm font-semibold text-zinc-600 md:text-base">
+                    合計が{" "}
+                    <span className="inline-flex items-baseline gap-1 rounded-[999px] border border-white/70 bg-white/80 px-3 py-1 font-black text-zinc-900 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                      <span className="text-[10px] font-black tracking-widest text-zinc-600">GOAL</span>
+                      <span className="text-xl font-black tabular-nums">{target}</span>
+                    </span>{" "}
+                    ぴったりで勝利！
+                  </div>
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-3">
-                {!isOnlineBattle ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setIsPaused(true)}
-                      className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                    >
-                      ポーズ
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={backToMenu}
-                      className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                    >
-                      モード選択へ
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      playSe("modoru");
-                      surrenderOnline();
-                    }}
-                    className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                  >
-                    降参
-                  </button>
-                )}
-
-                {!winner && (
-                  <button
-                    type="button"
-                    onClick={endTurnNow}
-                    disabled={!canInteract || movesLeft === TURN_ACTIONS}
-                    className={[
-                      "whitespace-nowrap rounded-3xl border px-5 py-4 text-sm font-black shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform md:px-4 md:py-3",
-                      !canInteract || movesLeft === TURN_ACTIONS
-                        ? "border-white/60 bg-white/55 text-zinc-500 opacity-75"
-                        : "border-white/70 bg-white/85 text-zinc-800 hover:brightness-105 active:scale-[0.98]",
-                    ].join(" ")}
-                  >
-                    ターン終了
-                  </button>
-                )}
-
-                <div className="flex items-center gap-2 rounded-3xl border border-white/70 bg-white/75 px-3 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
-                  {isOnlineBattle ? (
-                    <>
-                      <JellyImage
-                        src="/images/vs_online.png"
-                        alt="online"
-                        ring="rgba(160,255,210,.95)"
-                        size={38}
-                      />
-                      <div className="leading-tight">
-                        <div className="text-[10px] font-black tracking-widest text-zinc-600">VS</div>
-                        <div className="text-xs font-black text-zinc-800">
-                          {playerName} vs {onlineOpponentName || "Opponent"}
+              <div className="flex flex-wrap items-center gap-3 sm:justify-end">
+                {matchType !== "random" ? (
+                  <div className="flex items-center gap-2 rounded-3xl border border-white/70 bg-white/75 px-3 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                    {isOnlineBattle ? (
+                      <>
+                        <JellyImage
+                          src="/images/vs_online.png"
+                          alt="online"
+                          ring="rgba(160,255,210,.95)"
+                          size={38}
+                        />
+                        <div className="leading-tight">
+                          <div className="text-[10px] font-black tracking-widest text-zinc-600">VS</div>
+                          <div className="text-xs font-black text-zinc-800">
+                            {playerName} vs {onlineOpponentName || "Opponent"}
+                          </div>
                         </div>
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <JellyImage
-                        src={
-                          mode === "local" ? "/images/vs_player.png" : mode === "cpu" ? "/images/vs_cpu.png" : "/images/vs_online.png"
-                        }
-                        alt="mode"
-                        ring={
-                          mode === "local"
-                            ? "rgba(255,170,210,.95)"
-                            : mode === "cpu"
-                              ? "rgba(150,200,255,.95)"
-                              : "rgba(160,255,210,.95)"
-                        }
-                        size={38}
-                      />
-                      {mode === "cpu" && !onlineBotFallback ? (
+                      </>
+                    ) : (
+                      <>
                         <JellyImage
                           src={
-                            cpuDifficulty === "easy"
-                              ? "/images/easy.png"
-                              : cpuDifficulty === "normal"
-                                ? "/images/normal.png"
-                                : cpuDifficulty === "hard"
-                                  ? "/images/hard.png"
-                                  : "/images/god.png"
+                            mode === "local"
+                              ? "/images/vs_player.png"
+                              : mode === "cpu"
+                                ? "/images/vs_cpu.png"
+                                : "/images/vs_online.png"
                           }
-                          alt="difficulty"
+                          alt="mode"
                           ring={
-                            cpuDifficulty === "easy"
-                              ? "rgba(255,220,120,.95)"
-                              : cpuDifficulty === "normal"
+                            mode === "local"
+                              ? "rgba(255,170,210,.95)"
+                              : mode === "cpu"
                                 ? "rgba(150,200,255,.95)"
-                                : cpuDifficulty === "hard"
-                                  ? "rgba(210,160,255,.95)"
-                                  : "rgba(255,170,120,.95)"
+                                : "rgba(160,255,210,.95)"
                           }
                           size={38}
                         />
-                      ) : null}
-                      <div className="leading-tight">
-                        <div className="text-[10px] font-black tracking-widest text-zinc-600">MODE</div>
-                        <div className="text-xs font-black text-zinc-800">
-                          {mode === "local" ? "対人" : mode === "cpu" ? `CPU / ${cpuDifficulty.toUpperCase()}` : "オンライン"}
+                        {mode === "cpu" && !onlineBotFallback ? (
+                          <JellyImage
+                            src={
+                              cpuDifficulty === "easy"
+                                ? "/images/easy.png"
+                                : cpuDifficulty === "normal"
+                                  ? "/images/normal.png"
+                                  : cpuDifficulty === "hard"
+                                    ? "/images/hard.png"
+                                    : "/images/god.png"
+                            }
+                            alt="difficulty"
+                            ring={
+                              cpuDifficulty === "easy"
+                                ? "rgba(255,220,120,.95)"
+                                : cpuDifficulty === "normal"
+                                  ? "rgba(150,200,255,.95)"
+                                  : cpuDifficulty === "hard"
+                                    ? "rgba(210,160,255,.95)"
+                                    : "rgba(255,170,120,.95)"
+                            }
+                            size={38}
+                          />
+                        ) : null}
+                        <div className="leading-tight">
+                          <div className="text-[10px] font-black tracking-widest text-zinc-600">MODE</div>
+                          <div className="text-xs font-black text-zinc-800">
+                            {mode === "local"
+                              ? "対人"
+                              : mode === "cpu"
+                                ? `CPU / ${cpuDifficulty.toUpperCase()}`
+                                : "オンライン"}
+                          </div>
                         </div>
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                <div className="rounded-3xl border border-white/70 bg-white/75 px-4 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
-                  <div className="flex items-end justify-between gap-3">
-                    <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
-                    <div className="text-[10px] font-black text-zinc-500">自動で補充</div>
+                      </>
+                    )}
                   </div>
-
-                  <div className="mt-2 flex items-center justify-center gap-2">
-                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white text-2xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
-                      {nextPair.n0}
-                    </div>
-                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white/85 text-xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
-                      {nextPair.n1}
-                    </div>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => reset()}
-                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                >
-                  リセット
-                </button>
+                ) : null}
               </div>
             </header>
 
-            <section className="flex w-full flex-col items-center gap-5">
-              <div className="flex w-full flex-col items-center gap-4">
+            <section className="flex w-full flex-col items-center gap-5 md:flex-row md:items-start md:justify-center">
+              <div className="flex w-full flex-col items-center gap-4 md:max-w-[520px]">
                 {!winner && (
                   <div className="w-full max-w-sm">
                     <div className="relative h-12 rounded-[999px] border border-white/70 bg-white/75 p-1 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_18px_30px_rgba(90,60,160,.12)]">
@@ -3700,18 +3726,146 @@ export default function Page() {
                   </AnimatePresence>
                 </div>
 
-                {!winner && (
-                  <div className="text-xs font-semibold text-zinc-500">
-                    ヒント: {target} を超えると <span className="font-black text-zinc-700">sum % {target}</span>（ピカッと光る）
-                  </div>
-                )}
               </div>
+
+              <aside className="mt-2 flex w-full flex-col items-center gap-4 md:mt-0 md:max-w-[360px] md:items-stretch">
+                <div className="flex w-full flex-wrap items-center justify-center gap-3 md:justify-start">
+                  {!isOnlineBattle ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setIsPaused(true)}
+                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                      >
+                        ポーズ
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={backToMenu}
+                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                      >
+                        モード選択へ
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        playSe("modoru");
+                        surrenderOnline();
+                      }}
+                      className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                    >
+                      降参
+                    </button>
+                  )}
+                </div>
+
+                {!winner && (
+                  <button
+                    type="button"
+                    onClick={endTurnNow}
+                    disabled={!canInteract || movesLeft === TURN_ACTIONS}
+                    className={[
+                      "whitespace-nowrap rounded-3xl border px-5 py-4 text-sm font-black shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform md:px-4 md:py-3",
+                      !canInteract || movesLeft === TURN_ACTIONS
+                        ? "border-white/60 bg-white/55 text-zinc-500 opacity-75"
+                        : "border-white/70 bg-white/85 text-zinc-800 hover:brightness-105 active:scale-[0.98]",
+                    ].join(" ")}
+                  >
+                    ターン終了
+                  </button>
+                )}
+
+                <div className="rounded-3xl border border-white/70 bg-white/75 px-4 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
+                  <div className="flex items-end justify-between gap-3">
+                    <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
+                    <div className="text-[10px] font-black text-zinc-500">自動で補充</div>
+                  </div>
+
+                  <div className="mt-2 flex items-center justify-center gap-2">
+                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white text-2xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
+                      {nextPair.n0}
+                    </div>
+                    <div className="grid h-12 w-12 place-items-center rounded-3xl border border-white/70 bg-white/85 text-xl font-black tabular-nums text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.7)_inset,0_16px_26px_rgba(90,60,160,.12)]">
+                      {nextPair.n1}
+                    </div>
+                  </div>
+                </div>
+
+                {matchType !== "random" ? (
+                  <button
+                    type="button"
+                    onClick={() => reset()}
+                    className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                  >
+                    リセット
+                  </button>
+                ) : (
+                  // リセット非表示（random時は隠す）。枠だけ確保して崩れを抑える。
+                  <div className="h-[56px] md:h-[52px]" />
+                )}
+              </aside>
             </section>
           </div>
         </motion.div>
         )}
         </AnimatePresence>
       </div>
+
+      {helpOpen && screen === "play" && (
+        <motion.div
+          className="fixed inset-0 z-60"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <div className="absolute inset-0 bg-white/60 backdrop-blur-sm" onClick={() => setHelpOpen(false)} />
+          <div className="relative mx-auto flex h-full w-full max-w-2xl items-center justify-center px-4">
+            <motion.div
+              className="w-full rounded-[44px] border border-white/70 bg-gradient-to-b from-white/85 to-white/60 p-7 shadow-[0_34px_110px_rgba(120,70,40,.20)] backdrop-blur"
+              initial={{ scale: 0.96, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.98, y: 10 }}
+              transition={{ type: "spring", stiffness: 520, damping: 42 }}
+              role="dialog"
+              aria-modal="true"
+              aria-label="ヘルプ"
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-xs font-black tracking-[0.25em] text-zinc-500">HELP</div>
+                  <div className="mt-2 text-2xl font-black tracking-tight text-zinc-900">ルール & ヒント</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setHelpOpen(false)}
+                  className="grid h-10 w-10 place-items-center rounded-full border border-white/70 bg-white/85 text-zinc-800 shadow-[0_14px_30px_rgba(80,60,130,.10)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  aria-label="閉じる"
+                >
+                  <span className="text-sm font-black">×</span>
+                </button>
+              </div>
+
+              <div className="mt-6 space-y-3 text-sm font-semibold text-zinc-700">
+                <div>
+                  数字は「隣接する2マス」をタップして合体します。
+                </div>
+                <div>
+                  合体後の合計が <span className="font-black text-zinc-900">GOAL {target}</span> ぴったりなら勝利！
+                </div>
+                <div>
+                  GOAL を超えると合体結果は <span className="font-black text-zinc-900">sum % GOAL</span> になります。
+                </div>
+                <div className="text-xs font-bold text-zinc-500">
+                  ※ヒント表示は画面に出し過ぎないよう、必要なときだけこのヘルプで確認できます。
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        </motion.div>
+      )}
 
       <AnimatePresence>
       {isPaused && screen === "play" && (
