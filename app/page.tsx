@@ -522,6 +522,7 @@ export default function Page() {
   const [isPaused, setIsPaused] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
   const matchingRunIdRef = useRef(0);
 
   const [unlockedDifficulties, setUnlockedDifficulties] = useState<CpuDifficulty[]>(["easy", "normal"]);
@@ -2677,7 +2678,7 @@ export default function Page() {
                 <div className="mt-2 text-sm font-semibold text-zinc-600">スワイプ or クリックで合体。ぴったりを狙おう！</div>
               </div>
 
-              <div className="flex flex-col gap-3 sm:flex-row">
+              <div className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2">
                   <button
                   type="button"
                   onClick={() => {
@@ -2688,6 +2689,17 @@ export default function Page() {
                   className="flex-1 whitespace-nowrap rounded-[28px] bg-gradient-to-r from-emerald-400 to-cyan-400 px-6 py-4 text-base font-extrabold text-white shadow-[0_18px_30px_rgba(90,60,160,.20)] transition-transform hover:brightness-105 active:scale-[0.98]"
                 >
                   遊ぶ
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void startBgm();
+                    playSe("susumu");
+                    setIsRuleModalOpen(true);
+                  }}
+                  className="flex-1 whitespace-nowrap rounded-[28px] border border-white/70 bg-white/85 px-6 py-4 text-base font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                >
+                  遊び方
                 </button>
                 <button
                   type="button"
@@ -3813,6 +3825,79 @@ export default function Page() {
         )}
         </AnimatePresence>
       </div>
+
+      <AnimatePresence>
+        {isRuleModalOpen && (
+          <motion.div
+            className="fixed inset-0 z-70"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <div
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+              onClick={() => setIsRuleModalOpen(false)}
+            />
+
+            <div className="relative mx-auto flex h-full w-full max-w-2xl items-center justify-center px-4">
+              <motion.div
+                className="w-full rounded-3xl border border-white/70 bg-white/60 p-7 shadow-[0_34px_110px_rgba(120,70,40,.20)] backdrop-blur"
+                role="dialog"
+                aria-modal="true"
+                aria-label="遊び方"
+                initial={{ opacity: 0, scale: 0.98, y: 8 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.98, y: 8 }}
+                transition={{ duration: 0.18, ease: "easeOut" }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="text-xs font-black tracking-[0.25em] text-zinc-500">HOW TO PLAY</div>
+                    <div className="text-2xl font-black tracking-tight text-zinc-900">遊び方（ルール）</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsRuleModalOpen(false)}
+                    className="grid h-10 w-10 place-items-center rounded-full border border-white/70 bg-white/85 text-zinc-800 shadow-[0_14px_30px_rgba(80,60,130,.10)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                    aria-label="閉じる"
+                  >
+                    <span className="text-sm font-black">×</span>
+                  </button>
+                </div>
+
+                <div className="mt-6 space-y-5 text-sm font-semibold text-zinc-700">
+                  <div className="space-y-1">
+                    <div className="text-base font-black text-zinc-900">🎯 勝利条件</div>
+                    <div>
+                      隣り合う2つのマスの数字をタップして足し合わせ、ぴったり「25」を作ったプレイヤーの勝ちです。
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-base font-black text-zinc-900">⚠️ 25を超えたらどうなる？（重要）</div>
+                    <div>
+                      足した合計が25を超えた場合、「25で割った余り（sum % 25）」の数字に戻ってしまいます。
+                    </div>
+                    <div className="text-xs font-bold text-zinc-600">
+                      例：15に12を足すと合計27 → マスは「2」になります。
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-base font-black text-zinc-900">⚔️ 戦略のヒント</div>
+                    <div>
+                      わざと相手の数字をオーバーフロー（25オーバー）させて、小さな数字に戻してしまうのが勝利の鍵です。
+                    </div>
+                    <div className="text-xs font-bold text-zinc-600">1ターンで3回動かせます（=3アクション）。</div>
+                    <div className="text-xs font-bold text-zinc-600">次に降ってくる数字（NEXT）を見ながら戦略を練りましょう。</div>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {helpOpen && screen === "play" && (
         <motion.div
