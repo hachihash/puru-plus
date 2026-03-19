@@ -811,8 +811,8 @@ export default function Page() {
     })();
   }, [screen, statsRefreshNonce]);
 
-  const [bgmVolume, setBgmVolume] = useState<number>(70);
-  const [seVolume, setSeVolume] = useState<number>(70);
+  const [bgmMuted, setBgmMuted] = useState<boolean>(false);
+  const [seMuted, setSeMuted] = useState<boolean>(false);
 
   // Active game settings
   const [target, setTarget] = useState<number>(DEFAULT_TARGET);
@@ -959,14 +959,12 @@ export default function Page() {
   }, [timeLimitMs]);
 
   useEffect(() => {
-    // Restore saved volumes
+    // Restore mute settings
     try {
-      const bgmRaw = localStorage.getItem("plusBattleBgmVolume");
-      const seRaw = localStorage.getItem("plusBattleSeVolume");
-      const bgm = bgmRaw ? Number(bgmRaw) : null;
-      const se = seRaw ? Number(seRaw) : null;
-      if (bgm !== null && Number.isFinite(bgm)) setBgmVolume(Math.max(0, Math.min(100, bgm)));
-      if (se !== null && Number.isFinite(se)) setSeVolume(Math.max(0, Math.min(100, se)));
+      const bgmRaw = localStorage.getItem("plusBattleBgmMuted");
+      const seRaw = localStorage.getItem("plusBattleSeMuted");
+      if (bgmRaw === "1") setBgmMuted(true);
+      if (seRaw === "1") setSeMuted(true);
     } catch {
       // ignore
     }
@@ -994,12 +992,12 @@ export default function Page() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("plusBattleBgmVolume", String(bgmVolume));
-      localStorage.setItem("plusBattleSeVolume", String(seVolume));
+      localStorage.setItem("plusBattleBgmMuted", bgmMuted ? "1" : "0");
+      localStorage.setItem("plusBattleSeMuted", seMuted ? "1" : "0");
     } catch {
       // ignore
     }
-  }, [bgmVolume, seVolume]);
+  }, [bgmMuted, seMuted]);
 
   useEffect(() => {
     // Init BGM + SE assets once
@@ -1032,14 +1030,15 @@ export default function Page() {
     return () => {
       bgmAudioRef.current?.pause();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    // GainNode に反映（未生成なら後で ensureAudioGraph() が反映する）
-    if (bgmGainRef.current) bgmGainRef.current.gain.value = bgmVolume / 100;
-    if (seMasterGainRef.current) seMasterGainRef.current.gain.value = seVolume / 100;
-  }, [bgmVolume, seVolume]);
+    // iOS 互換: volume ではなく muted を切り替える
+    if (bgmAudioRef.current) bgmAudioRef.current.muted = bgmMuted;
+    Object.values(seAudioCacheRef.current).forEach((a) => {
+      a.muted = seMuted;
+    });
+  }, [bgmMuted, seMuted]);
 
   function ensureAudioGraph() {
     if (typeof window === "undefined") return;
@@ -1050,8 +1049,9 @@ export default function Page() {
       audioCtxRef.current = new AudioCtx();
       bgmGainRef.current = audioCtxRef.current.createGain();
       seMasterGainRef.current = audioCtxRef.current.createGain();
-      bgmGainRef.current.gain.value = bgmVolume / 100;
-      seMasterGainRef.current.gain.value = seVolume / 100;
+      // muted 方式を採用するため、基準ゲインは固定 1.0
+      bgmGainRef.current.gain.value = 1;
+      seMasterGainRef.current.gain.value = 1;
       bgmGainRef.current.connect(audioCtxRef.current.destination);
       seMasterGainRef.current.connect(audioCtxRef.current.destination);
     }
@@ -1154,6 +1154,7 @@ export default function Page() {
   useEffect(() => {
     // Best-effort: browsers may block autoplay, so it's safe to ignore failures.
     void startBgm();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
     isProcessingRef.current = isProcessing;
@@ -2155,10 +2156,59 @@ export default function Page() {
     const praises = ["ナイスプラス！", "完璧な計算！", "天才か？", "読みが鋭い！", "神業…！", "しびれる一手！"];
     setVictoryPraise(praises[Math.floor(Math.random() * praises.length)]!);
     pendingWinnerTimeoutRef.current = window.setTimeout(() => {
-      setWinner(p);
-      setPendingWinner(null);
-      pendingWinnerRef.current = null;
-      pendingWinnerTimeoutRef.current = null;
+      void (async () => {
+        // iPhone/Safari 向け:
+        // 勝敗演出ディレイ中に DB の最新レートを直接取得し、結果表示直前の値を強制同期する
+        try {
+          if (matchTypeRef.current === "random") {
+            const myUserId = getClientId();
+            const oppUserId = onlineOpponentUserId;
+
+            const before = resultRateChange;
+            const [{ data: myLatest }, { data: oppLatest }] = await Promise.all([
+              supabase
+                .from("player_ratings")
+                .select("rating")
+                .eq("user_id", myUserId)
+                .maybeSingle<PlayerRatingRow>(),
+              oppUserId
+                ? supabase
+                    .from("player_ratings")
+                    .select("rating")
+                    .eq("user_id", oppUserId)
+                    .maybeSingle<PlayerRatingRow>()
+                : Promise.resolve({ data: null }),
+            ]);
+
+            const myAfter = myLatest?.rating && Number.isFinite(myLatest.rating) ? Math.round(myLatest.rating) : playerRateRef.current;
+            const oppAfter =
+              oppLatest && oppLatest.rating && Number.isFinite(oppLatest.rating)
+                ? Math.round(oppLatest.rating)
+                : opponentRateRef.current;
+
+            setPlayerRate(myAfter);
+            if (oppUserId) setOpponentRate(oppAfter);
+
+            if (before) {
+              setResultRateChange({
+                yourBefore: before.yourBefore,
+                yourAfter: myAfter,
+                opponentBefore: before.opponentBefore,
+                opponentAfter: oppAfter,
+                yourDelta: myAfter - before.yourBefore,
+                opponentDelta: oppAfter - before.opponentBefore,
+              });
+            }
+          }
+        } catch {
+          // ignore
+        } finally {
+          setWinner(p);
+          setPendingWinner(null);
+          pendingWinnerRef.current = null;
+          pendingWinnerTimeoutRef.current = null;
+        }
+      })();
     }, delayMs);
   }
 
@@ -2242,6 +2292,7 @@ export default function Page() {
     }
     const isGod = modeRef.current === "cpu" && cpuDifficultyRef.current === "god" && winner === 1;
     playSe(isGod ? "godwin" : "win");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [winner]);
 
   /**
@@ -2874,7 +2925,7 @@ export default function Page() {
   }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode, pendingWinner]);
 
   return (
-    <main className="min-h-[100dvh] text-zinc-900">
+    <main className="h-[100dvh] max-h-screen overflow-hidden text-zinc-900">
       {/* Gooey (slime/water merge) effect */}
       <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
         <defs>
@@ -2944,7 +2995,7 @@ export default function Page() {
           </motion.div>
         ))}
       </div>
-      <div className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center px-4 py-4 md:py-6">
+      <div className="relative z-10 mx-auto flex h-full max-h-full w-full max-w-4xl flex-col items-center overflow-hidden px-3 py-2 md:px-4 md:py-4">
         <AnimatePresence mode="wait">
         {screen === "title" ? (
           <motion.div
@@ -3041,28 +3092,30 @@ export default function Page() {
 
               <div className="grid w-full gap-6 sm:grid-cols-2">
                 <div className="rounded-[28px] border border-white/70 bg-white/75 p-4">
-                  <div className="text-sm font-black text-zinc-700">BGM音量</div>
-                  <div className="mt-1 text-xs font-semibold text-zinc-600">{bgmVolume}%</div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={bgmVolume}
-                    onChange={(e) => setBgmVolume(Number(e.target.value))}
-                    className="mt-3 w-full accent-teal-500"
-                  />
+                  <div className="text-sm font-black text-zinc-700">BGM</div>
+                  <div className="mt-1 text-xs font-semibold text-zinc-600">
+                    {bgmMuted ? "ミュート中" : "再生中"}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBgmMuted((v) => !v)}
+                    className="mt-3 w-full rounded-2xl border border-white/70 bg-white/85 px-4 py-3 text-sm font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.72)_inset,0_14px_22px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  >
+                    {bgmMuted ? "🔇 BGMミュートON" : "🔊 BGMミュートOFF"}
+                  </button>
                 </div>
                 <div className="rounded-[28px] border border-white/70 bg-white/75 p-4">
-                  <div className="text-sm font-black text-zinc-700">SE音量</div>
-                  <div className="mt-1 text-xs font-semibold text-zinc-600">{seVolume}%</div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={seVolume}
-                    onChange={(e) => setSeVolume(Number(e.target.value))}
-                    className="mt-3 w-full accent-fuchsia-500"
-                  />
+                  <div className="text-sm font-black text-zinc-700">SE</div>
+                  <div className="mt-1 text-xs font-semibold text-zinc-600">
+                    {seMuted ? "ミュート中" : "再生中"}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSeMuted((v) => !v)}
+                    className="mt-3 w-full rounded-2xl border border-white/70 bg-white/85 px-4 py-3 text-sm font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.72)_inset,0_14px_22px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  >
+                    {seMuted ? "🔇 SEミュートON" : "🔊 SEミュートOFF"}
+                  </button>
                 </div>
               </div>
 
@@ -3615,7 +3668,7 @@ export default function Page() {
           exit={{ opacity: 0, y: -10, scale: 0.98 }}
           transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
         >
-          <div className="flex flex-col gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-4 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-6">
+          <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-6">
             <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
               <div className="space-y-2">
                 <div className="flex w-full items-center justify-between gap-3">
@@ -3804,7 +3857,7 @@ export default function Page() {
               </div>
             </header>
 
-            <section className="flex w-full flex-col items-center gap-5 md:flex-row md:items-start md:justify-center">
+            <section className="flex w-full flex-1 flex-col items-center gap-3 md:gap-5 md:flex-row md:items-start md:justify-center">
               <div className="flex w-full flex-col items-center gap-4 md:max-w-[520px]">
                 {!winner && (
                   <div className="w-full max-w-sm">
@@ -3843,8 +3896,8 @@ export default function Page() {
                           onTouchEnd={(e) => handleTouchEnd(idx, e)}
                           disabled={!canInteract}
                           className={[
-                            "relative grid h-28 w-28 select-none place-items-center rounded-3xl border-2 touch-none",
-                            "md:h-36 md:w-36",
+                            "relative grid h-24 w-24 select-none place-items-center rounded-3xl border-2 touch-none sm:h-28 sm:w-28",
+                            "md:h-32 md:w-32",
                             "transition-[filter,transform] duration-150 active:scale-[0.98]",
                             "outline-none focus-visible:ring-4 focus-visible:ring-white/70 focus-visible:ring-offset-0",
                             canInteract ? "cursor-pointer" : "cursor-default opacity-95",
