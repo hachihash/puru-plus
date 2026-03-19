@@ -3939,7 +3939,7 @@ export default function Page() {
 
                   <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1">
                 <div className="relative aspect-square w-[min(100%,60dvh)] touch-none overscroll-contain sm:w-full sm:max-w-[460px]" ref={boardWrapRef}>
-                  <div className="grid grid-cols-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-3 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-4">
+                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 place-items-center gap-1 rounded-[36px] border border-white/70 bg-white/65 p-1 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-2 md:rounded-[44px] md:p-2">
                     {board.map((value, idx) => {
                       const isSelected = selected === idx;
                       const isFlashing = flashIndex === idx;
