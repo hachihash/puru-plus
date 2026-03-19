@@ -591,6 +591,9 @@ export default function Page() {
   } | null>(null);
   const [resultRateNonce, setResultRateNonce] = useState(0);
 
+  // iPhone 対応：結果モーダル表示直前に最新レートを再取得してから表示するためのゲート
+  const [resultModalReady, setResultModalReady] = useState(true);
+
   const onlineBotFallbackRef = useRef<boolean>(false);
 
   // Online waiting (room ID sync)
@@ -860,6 +863,11 @@ export default function Page() {
   const winnerRef = useRef<Winner>(winner);
   const pendingWinnerRef = useRef<Winner>(pendingWinner);
   const timeLimitMsRef = useRef<number | null>(timeLimitMs);
+  // オンライン対戦時の「相手ターン中は自分側タイマーを進めない」ための固定表示用
+  const frozenTimeLeftMsRef = useRef<number | null>(null);
+  // 遅延 Realtime 通知（残像）を捨てるための「ターンの壁」
+  const turnWallUntilRef = useRef<number>(0);
+  const wasMyTurnRef = useRef<boolean>(false);
   const matchTypeRef = useRef<"random" | "room" | null>(matchType);
   const cpuTimeoutRef = useRef<number | null>(null);
   const cpuPlannedLineRef = useRef<PlannedMove[] | null>(null);
@@ -878,6 +886,14 @@ export default function Page() {
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
   const seAudioCacheRef = useRef<Record<string, HTMLAudioElement>>({});
   const bgmTriedRef = useRef(false);
+
+  // Web Audio API (iOS 対応: volume property が効かないため GainNode 経由に切り替え)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const bgmGainRef = useRef<GainNode | null>(null);
+  const seMasterGainRef = useRef<GainNode | null>(null);
+  const bgmSourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const seSourceNodesRef = useRef<Record<string, MediaElementAudioSourceNode>>({});
+  const seSoundGainNodesRef = useRef<Record<string, GainNode>>({});
 
   useEffect(() => {
     boardRef.current = board;
@@ -990,7 +1006,8 @@ export default function Page() {
     const bgm = new Audio("/music/bgm.mp3");
     bgm.loop = true;
     bgm.preload = "auto";
-    bgm.volume = bgmVolume / 100;
+    // iOS: 実際の音量は Web Audio の GainNode 側で制御する
+    bgm.volume = 1;
     bgmAudioRef.current = bgm;
 
     // Pre-cache SE audio objects
@@ -1007,8 +1024,8 @@ export default function Page() {
     seFiles.forEach(([k, url]) => {
       const a = new Audio(url);
       a.preload = "auto";
-      const gain = SE_GAINS[k] ?? 1;
-      a.volume = Math.min(1, (seVolume / 100) * gain);
+      // iOS: 実際の音量は Web Audio の GainNode 側で制御する
+      a.volume = 1;
       seAudioCacheRef.current[k] = a;
     });
     // Try to start BGM immediately (may be blocked by browser, so it's safe to ignore)
@@ -1019,14 +1036,84 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    if (bgmAudioRef.current) bgmAudioRef.current.volume = bgmVolume / 100;
-    Object.entries(seAudioCacheRef.current).forEach(([k, a]) => {
-      const gain = SE_GAINS[k] ?? 1;
-      a.volume = Math.min(1, (seVolume / 100) * gain);
-    });
+    // GainNode に反映（未生成なら後で ensureAudioGraph() が反映する）
+    if (bgmGainRef.current) bgmGainRef.current.gain.value = bgmVolume / 100;
+    if (seMasterGainRef.current) seMasterGainRef.current.gain.value = seVolume / 100;
   }, [bgmVolume, seVolume]);
 
+  function ensureAudioGraph() {
+    if (typeof window === "undefined") return;
+    const AudioCtx =
+      window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioCtx();
+      bgmGainRef.current = audioCtxRef.current.createGain();
+      seMasterGainRef.current = audioCtxRef.current.createGain();
+      bgmGainRef.current.gain.value = bgmVolume / 100;
+      seMasterGainRef.current.gain.value = seVolume / 100;
+      bgmGainRef.current.connect(audioCtxRef.current.destination);
+      seMasterGainRef.current.connect(audioCtxRef.current.destination);
+    }
+
+    // BGM 接続
+    if (bgmAudioRef.current && bgmGainRef.current && audioCtxRef.current && !bgmSourceNodeRef.current) {
+      try {
+        bgmSourceNodeRef.current = audioCtxRef.current.createMediaElementSource(bgmAudioRef.current);
+        bgmSourceNodeRef.current.connect(bgmGainRef.current);
+      } catch {
+        // ignore
+      }
+    }
+
+    // SE 接続
+    if (seMasterGainRef.current && audioCtxRef.current) {
+      Object.entries(seAudioCacheRef.current).forEach(([k, a]) => {
+        if (!a) return;
+        if (seSourceNodesRef.current[k]) return;
+        try {
+          const src = audioCtxRef.current!.createMediaElementSource(a);
+          const soundGain = audioCtxRef.current!.createGain();
+          soundGain.gain.value = SE_GAINS[k] ?? 1;
+          src.connect(soundGain);
+          soundGain.connect(seMasterGainRef.current!);
+          seSourceNodesRef.current[k] = src;
+          seSoundGainNodesRef.current[k] = soundGain;
+        } catch {
+          // ignore
+        }
+      });
+    }
+  }
+
+  async function resumeAudioContext() {
+    ensureAudioGraph();
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === "suspended") {
+      try {
+        await ctx.resume();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  useEffect(() => {
+    // iOS Safari は最初のユーザー操作まで AudioContext を resume できないため、
+    // 最初のタップで必ず resume する（以後は once で無視）
+    const onFirstGesture = () => {
+      void resumeAudioContext();
+    };
+    window.addEventListener("pointerdown", onFirstGesture, { once: true });
+    return () => window.removeEventListener("pointerdown", onFirstGesture);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function startBgm() {
+    // iOS Safari: ユーザー操作後に AudioContext を resume する必要があるため、
+    // 再生直前に resume を試みる
+    await resumeAudioContext();
     if (!bgmAudioRef.current) return;
     try {
       const audio = bgmAudioRef.current;
@@ -1044,16 +1131,19 @@ export default function Page() {
   function playSe(
     key: "sentaku" | "susumu" | "modoru" | "yuugou1" | "yuugou2" | "make" | "win" | "godwin",
   ) {
-    const a = seAudioCacheRef.current[key];
-    if (!a) return;
-    try {
-      a.currentTime = 0;
-      void a.play().catch(() => {
+    // iOS Safari: context が suspended の場合は resume してから再生する
+    void resumeAudioContext().then(() => {
+      const a = seAudioCacheRef.current[key];
+      if (!a) return;
+      try {
+        a.currentTime = 0;
+        void a.play().catch(() => {
+          // ignore
+        });
+      } catch {
         // ignore
-      });
-    } catch {
-      // ignore
-    }
+      }
+    });
   }
 
   function playRandomYuugou() {
@@ -1118,10 +1208,54 @@ export default function Page() {
   useEffect(() => {
     // タイマー表示（timeLeftMs）のための nowMs 更新。
     // ターンごとに setInterval を増殖させないよう、開始条件/cleanup を useEffect 側で一元管理します。
-    if (screen !== "play" || isPaused || winner) return;
+    const shouldTickNow =
+      screen === "play" &&
+      !isPaused &&
+      !winner &&
+      (mode !== "online" || (!!online && online.player === currentPlayer));
+    if (!shouldTickNow) return;
     const t = window.setInterval(() => setNowMs(Date.now()), 120);
     return () => window.clearInterval(t);
-  }, [screen, isPaused, winner]);
+  }, [screen, isPaused, winner, mode, online, currentPlayer]);
+
+  useEffect(() => {
+    // オンライン対戦のタイマー同期（ターン壁）
+    // - 自分のターン開始時に movesLeft/タイマーを強制リセット
+    // - 相手のターン中は自分側タイマーが減らないよう表示を固定
+    if (screen !== "play") return;
+    if (mode !== "online") return;
+    if (!online) return;
+    if (isPaused || winner) return;
+    if (pendingWinnerRef.current) return;
+
+    const myTurn = online.player === currentPlayer;
+    const prevMyTurn = wasMyTurnRef.current;
+
+    // 自分のターンに切り替わった瞬間
+    if (myTurn && !prevMyTurn) {
+      // ターン壁: 遅延した opponent broadcast の残像（movesLeft の不正減算など）を短時間捨てる
+      turnWallUntilRef.current = Date.now() + 600;
+
+      // 明示的に「残り3回」を強制（UI の誤認を確実に防ぐ）
+      movesLeftRef.current = TURN_ACTIONS;
+      setMovesLeft(TURN_ACTIONS);
+
+      // タイマーもターン開始時に規定秒数で上書き
+      const limit = timeLimitMsRef.current;
+      const deadline = limit === null ? null : Date.now() + limit;
+      setActionDeadlineMs(deadline);
+      // 相手ターン中の表示固定用
+      frozenTimeLeftMsRef.current = limit === null ? null : limit;
+    }
+
+    // 相手のターンに切り替わった瞬間（表示だけ固定）
+    if (!myTurn && prevMyTurn) {
+      frozenTimeLeftMsRef.current =
+        actionDeadlineMs === null ? null : Math.max(0, actionDeadlineMs - Date.now());
+    }
+
+    wasMyTurnRef.current = myTurn;
+  }, [actionDeadlineMs, currentPlayer, isPaused, mode, online, pendingWinner, screen, winner]);
 
   // pendingWinner が非 null の間は「勝敗演出待ち」なので、CPUの思考/自動操作を止める
   const isCpuTurn =
@@ -1175,9 +1309,16 @@ export default function Page() {
 
   const timeLeftMs = useMemo<number | null>(() => {
     if (screen !== "play" || isPaused || winner) return 0;
-    if (actionDeadlineMs === null) return null;
-    return Math.max(0, actionDeadlineMs - nowMs);
-  }, [actionDeadlineMs, isPaused, nowMs, screen, winner]);
+    const computed = actionDeadlineMs === null ? null : Math.max(0, actionDeadlineMs - nowMs);
+
+    // オンライン対戦で「相手ターン中」は自分側タイマーが勝手に減るのを防ぐ
+    // （ターン壁: delayed broadcast の残像で表示だけズレるのを抑える）
+    if (mode === "online" && online && online.player !== currentPlayer) {
+      return frozenTimeLeftMsRef.current ?? computed;
+    }
+
+    return computed;
+  }, [actionDeadlineMs, currentPlayer, isPaused, mode, nowMs, online, screen, winner]);
 
   const timeLeftSec = useMemo(() => (timeLeftMs === null ? null : Math.ceil(timeLeftMs / 1000)), [timeLeftMs]);
 
@@ -1665,6 +1806,15 @@ export default function Page() {
     channel.on("broadcast", { event: "state" }, (payload) => {
       const data = payload.payload as unknown as OnlineBroadcastState;
       if (!data || data.clientId === clientId) return;
+
+      // ターン壁：自分のターン開始直後に遅延して届いた opponent 側 broadcast を無視して、
+      // movesLeft やタイマーの「残像ゴースト」を防ぐ
+      if (modeRef.current === "online") {
+        if (Date.now() < turnWallUntilRef.current && data.currentPlayer !== currentPlayerRef.current) {
+          return;
+        }
+      }
+
       // apply authoritative state
       const prev = boardRef.current;
       setTarget(data.target);
@@ -1938,6 +2088,7 @@ export default function Page() {
     if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
     setUnlockMessage(null);
     setShowGodVictory(false);
+    setResultModalReady(true);
     setPendingWinner(null);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
     pendingWinnerTimeoutRef.current = null;
@@ -1993,6 +2144,8 @@ export default function Page() {
   function win(p: Player, delayMs: number = 500) {
     // すでに勝敗が確定/演出中の場合は二重処理を防ぐ
     if (winnerRef.current || pendingWinnerRef.current) return;
+    // まず結果モーダルは非表示にして、最新レート再取得後に表示する
+    setResultModalReady(false);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
     // pendingWinner は「勝利演出中の入力ロック」にも使うため、ref と state を即時同期する
     pendingWinnerRef.current = p;
@@ -2108,7 +2261,8 @@ export default function Page() {
     hasPersistedMatchRef.current = true;
 
     void (async () => {
-      const myUserId = getClientId();
+      try {
+        const myUserId = getClientId();
       const turnsUsed = turnsRef.current;
       const turnsToGoal25 = turnsToGoal25Ref.current;
 
@@ -2124,10 +2278,26 @@ export default function Page() {
           const beforeOpp = opponentRateRef.current;
           // ホストの UPDATE が完了する前にゲストが取得してしまうのを避けるため少し待つ
           await new Promise((r) => setTimeout(r, 250));
-          const [afterYour, afterOpp] = await Promise.all([
-            getOrCreatePlayerRating(myUserId),
-            getOrCreatePlayerRating(onlineOpponentUserId),
+
+          // iPhone 対応：結果表示直前に最新レートを直接 SELECT して上書きする
+          const [
+            { data: yourRow },
+            { data: oppRow },
+          ] = await Promise.all([
+            supabase
+              .from("player_ratings")
+              .select("rating")
+              .eq("user_id", myUserId)
+              .maybeSingle<PlayerRatingRow>(),
+            supabase
+              .from("player_ratings")
+              .select("rating")
+              .eq("user_id", onlineOpponentUserId)
+              .maybeSingle<PlayerRatingRow>(),
           ]);
+
+          const afterYour = yourRow?.rating && Number.isFinite(yourRow.rating) ? Math.round(yourRow.rating) : 1500;
+          const afterOpp = oppRow?.rating && Number.isFinite(oppRow.rating) ? Math.round(oppRow.rating) : 1500;
 
           setPlayerRate(afterYour);
           setOpponentRate(afterOpp);
@@ -2274,9 +2444,53 @@ export default function Page() {
         if (myUserId === player2Id) setPlayerRate(newRatingB);
         if (opponentUserIdForElo === player1Id) setOpponentRate(newRatingA);
         if (opponentUserIdForElo === player2Id) setOpponentRate(newRatingB);
+
+        // iPhone 対応：結果表示直前に最新レートを直接 SELECT して上書きする
+        // （Elo 計算→UPDATE→状態反映の非同期で UI が古い値のままになるのを防ぐ）
+        try {
+          if (dbMatchType === "random") {
+            const yourUserId = myUserId === player1Id ? player1Id : player2Id;
+            const oppUserId = yourUserId === player1Id ? player2Id : player1Id;
+
+            const [{ data: yourLatestRow }, { data: oppLatestRow }] = await Promise.all([
+              supabase
+                .from("player_ratings")
+                .select("rating")
+                .eq("user_id", yourUserId)
+                .maybeSingle<PlayerRatingRow>(),
+              supabase
+                .from("player_ratings")
+                .select("rating")
+                .eq("user_id", oppUserId)
+                .maybeSingle<PlayerRatingRow>(),
+            ]);
+
+            const yourAfterLatest =
+              yourLatestRow?.rating && Number.isFinite(yourLatestRow.rating) ? Math.round(yourLatestRow.rating) : yourAfter;
+            const opponentAfterLatest =
+              oppLatestRow?.rating && Number.isFinite(oppLatestRow.rating) ? Math.round(oppLatestRow.rating) : opponentAfter;
+
+            setPlayerRate(yourAfterLatest);
+            setOpponentRate(opponentAfterLatest);
+            setResultRateChange({
+              yourBefore,
+              yourAfter: yourAfterLatest,
+              opponentBefore,
+              opponentAfter: opponentAfterLatest,
+              yourDelta: yourAfterLatest - yourBefore,
+              opponentDelta: opponentAfterLatest - opponentBefore,
+            });
+          }
+        } catch {
+          // ignore (再取得失敗時は Elo 計算済みの値をそのまま使う)
+        }
       } catch (err) {
         console.error("[match persistence failed]", err);
         // DBエラーでもゲーム進行を止めない
+      }
+      } finally {
+        // iPhone 対応：結果モーダル表示の準備が整ったらゲートを開く
+        setResultModalReady(true);
       }
     })();
   }, [winner, screen, onlineOpponentUserId, online]);
@@ -3420,10 +3634,14 @@ export default function Page() {
                   {isOnlineBattle && (
                     <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
                       {matchType === "random"
-                        ? `${playerName} (Rate: ${playerRate}) VS ${
+                        ? `${playerName} (Rate: ${playerRate})${
+                            online?.player === 1 ? " (YOU / P1)" : online?.player === 2 ? " (YOU / P2)" : ""
+                          } VS ${
                             onlineOpponentName || "Opponent"
                           } (Rate: ${opponentRateForDisplay})`
-                        : `${playerName} vs ${onlineOpponentName || "Opponent"}`}
+                        : `${playerName}${
+                            online?.player === 1 ? " (YOU / P1)" : online?.player === 2 ? " (YOU / P2)" : ""
+                          } vs ${onlineOpponentName || "Opponent"}`}
                     </div>
                   )}
 
@@ -4090,7 +4308,7 @@ export default function Page() {
       </AnimatePresence>
 
       <AnimatePresence>
-      {winner && (
+      {winner && resultModalReady && (
         <motion.div
           className="fixed inset-0 z-50"
           initial={{ opacity: 0 }}
