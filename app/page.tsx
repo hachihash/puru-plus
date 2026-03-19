@@ -1342,7 +1342,9 @@ export default function Page() {
 
   const mergeAnim = useMemo(() => {
     if (!moveOverlay) return null;
-    const tileHalf = 48; // h-24 w-24
+    const measuredTile = tileRefs.current[moveOverlay.to]?.getBoundingClientRect().width ?? 96;
+    const tileSize = Math.max(56, Math.min(220, measuredTile));
+    const tileHalf = tileSize / 2;
     const fromTL = { x: moveOverlay.fromCenter.x - tileHalf, y: moveOverlay.fromCenter.y - tileHalf };
     const toTL = { x: moveOverlay.toCenter.x - tileHalf, y: moveOverlay.toCenter.y - tileHalf };
     const fusionTL = { x: moveOverlay.fusionCenter.x - tileHalf, y: moveOverlay.fusionCenter.y - tileHalf };
@@ -1357,7 +1359,7 @@ export default function Page() {
     const wobblePx = 6;
     const rotateDeg = Math.max(-10, Math.min(10, ux * 10));
 
-    return { fromTL, toTL, fusionTL, ux, uy, prePushPx, wobblePx, rotateDeg };
+    return { fromTL, toTL, fusionTL, ux, uy, prePushPx, wobblePx, rotateDeg, tileSize };
   }, [moveOverlay]);
 
   function getClientId() {
@@ -3938,8 +3940,8 @@ export default function Page() {
                   </div>
 
                   <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1">
-                <div className="relative aspect-square w-[min(100%,60dvh)] touch-none overscroll-contain sm:w-full sm:max-w-[460px]" ref={boardWrapRef}>
-                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 place-items-center gap-1 rounded-[36px] border border-white/70 bg-white/65 p-1 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-2 md:rounded-[44px] md:p-2">
+                <div className="relative mx-auto aspect-square w-full max-w-[400px] touch-none overscroll-contain" ref={boardWrapRef}>
+                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-6 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-8">
                     {board.map((value, idx) => {
                       const isSelected = selected === idx;
                       const isFlashing = flashIndex === idx;
@@ -3956,8 +3958,7 @@ export default function Page() {
                           onTouchEnd={(e) => handleTouchEnd(idx, e)}
                           disabled={!canInteract}
                           className={[
-                            "relative grid h-24 w-24 select-none place-items-center rounded-3xl border-2 touch-none sm:h-28 sm:w-28",
-                            "md:h-32 md:w-32",
+                            "relative grid w-full aspect-square select-none place-items-center rounded-3xl border-2 touch-none",
                             "transition-[filter,transform] duration-150 active:scale-[0.98]",
                             "outline-none focus-visible:ring-4 focus-visible:ring-white/70 focus-visible:ring-offset-0",
                             canInteract ? "cursor-pointer" : "cursor-default opacity-95",
@@ -4010,8 +4011,10 @@ export default function Page() {
                         {/* Incoming block (slime pulls toward fusion point) */}
                         <motion.div
                           key={`${moveOverlay.id}-from`}
-                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
                           style={{
+                            width: mergeAnim.tileSize,
+                            height: mergeAnim.tileSize,
                             background: tileStyle(moveOverlay.fromValue, targetRef.current).background,
                             borderColor: tileStyle(moveOverlay.fromValue, targetRef.current).borderColor,
                             boxShadow: tileStyle(moveOverlay.fromValue, targetRef.current).boxShadow,
@@ -4036,14 +4039,18 @@ export default function Page() {
                           }}
                         >
                           <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
-                          <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.fromValue}</div>
+                          <div className="relative z-10 flex h-full w-full items-center justify-center text-center leading-none">
+                            <span className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.fromValue}</span>
+                          </div>
                         </motion.div>
 
                         {/* Merging block (victim does a tiny reverse preload before collision) */}
                         <motion.div
                           key={`${moveOverlay.id}-to`}
-                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid place-items-center rounded-3xl border-0 text-5xl font-black tabular-nums text-black/70"
                           style={{
+                            width: mergeAnim.tileSize,
+                            height: mergeAnim.tileSize,
                             background: tileStyle(moveOverlay.toValueBefore, targetRef.current).background,
                             borderColor: tileStyle(moveOverlay.toValueBefore, targetRef.current).borderColor,
                             boxShadow: tileStyle(moveOverlay.toValueBefore, targetRef.current).boxShadow,
@@ -4076,14 +4083,18 @@ export default function Page() {
                           }}
                         >
                           <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
-                          <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueBefore}</div>
+                          <div className="relative z-10 flex h-full w-full items-center justify-center text-center leading-none">
+                            <span className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueBefore}</span>
+                          </div>
                         </motion.div>
 
                         {/* Collision splash (water-mix / slime texture) */}
                         <motion.div
                           key={`${moveOverlay.id}-splash`}
-                          className="pointer-events-none absolute left-0 top-0 z-9 h-24 w-24 rounded-full"
+                          className="pointer-events-none absolute left-0 top-0 z-9 rounded-full"
                           style={{
+                            width: mergeAnim.tileSize,
+                            height: mergeAnim.tileSize,
                             background: `radial-gradient(circle at 50% 50%, rgba(255,255,255,.88), ${tileStyle(
                               moveOverlay.toValueAfter,
                               targetRef.current
@@ -4108,8 +4119,10 @@ export default function Page() {
                         {/* Fusion result (pull -> squish -> ploon bounce) */}
                         <motion.div
                           key={`${moveOverlay.id}-fusion`}
-                          className="pointer-events-none absolute left-0 top-0 z-10 grid h-24 w-24 place-items-center rounded-3xl border-2 text-5xl font-black tabular-nums text-black/70"
+                          className="pointer-events-none absolute left-0 top-0 z-10 grid place-items-center rounded-3xl border-2 text-5xl font-black tabular-nums text-black/70"
                           style={{
+                            width: mergeAnim.tileSize,
+                            height: mergeAnim.tileSize,
                             background: tileStyle(moveOverlay.toValueAfter, targetRef.current).background,
                             borderColor: tileStyle(moveOverlay.toValueAfter, targetRef.current).borderColor,
                             boxShadow: tileStyle(moveOverlay.toValueAfter, targetRef.current).boxShadow,
@@ -4134,7 +4147,9 @@ export default function Page() {
                             style={{ transformOrigin: "center" }}
                           >
                             <div className="absolute inset-0 rounded-3xl bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,.95),transparent_55%)] opacity-80" />
-                            <div className="relative drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueAfter}</div>
+                            <div className="relative z-10 flex h-full w-full items-center justify-center text-center leading-none">
+                              <span className="drop-shadow-[0_3px_0_rgba(255,255,255,.55)]">{moveOverlay.toValueAfter}</span>
+                            </div>
                           </motion.div>
                         </motion.div>
                       </>
