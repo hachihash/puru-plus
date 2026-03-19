@@ -246,6 +246,106 @@ function chooseDefensiveLine(
   return best?.line ?? null;
 }
 
+function countOpponentWinStepPatterns3(
+  board: number[],
+  nextQueue: number[],
+  nextIndex: number,
+  target: number,
+): { c1: number; c2: number; c3: number; total: number } {
+  // Depth=3 fixed => 8^3=512 sequences.
+  // c1/c2/c3 count how many sequences result in a win at step 1/2/3.
+  const base = LEGAL_MOVES.length; // 8
+  const mul = (step: 1 | 2 | 3) => powInt(base, 3 - step);
+
+  let c1 = 0;
+  let c2 = 0;
+  let c3 = 0;
+
+  const refill0 = nextQueue[nextIndex] ?? 1;
+  const refill1 = nextQueue[nextIndex + 1] ?? 1;
+  const refill2 = nextQueue[nextIndex + 2] ?? 1;
+
+  for (const m0 of LEGAL_MOVES) {
+    const r0 = applyMove(board, m0.from, m0.to, refill0, target);
+    if (r0.didWin) {
+      c1 += mul(1);
+      continue;
+    }
+
+    for (const m1 of LEGAL_MOVES) {
+      const r1 = applyMove(r0.nextBoard, m1.from, m1.to, refill1, target);
+      if (r1.didWin) {
+        c2 += mul(2);
+        continue;
+      }
+
+      for (const m2 of LEGAL_MOVES) {
+        const r2 = applyMove(r1.nextBoard, m2.from, m2.to, refill2, target);
+        if (r2.didWin) {
+          c3 += mul(3);
+        }
+      }
+    }
+  }
+
+  const total = c1 + c2 + c3;
+  return { c1, c2, c3, total };
+}
+
+function chooseGodDefensiveLine(
+  board: number[],
+  nextQueue: number[],
+  nextIndex: number,
+  target: number,
+  remaining: number,
+  rng: () => number,
+): Move[] | null {
+  const aiLines = enumerateAiLinesNonWinning(board, nextQueue, nextIndex, target, remaining);
+  if (!aiLines.length) return null;
+
+  const opponentNextIndex = nextIndex + remaining;
+
+  let best:
+    | {
+        line: Move[];
+        c1: number;
+        c2: number;
+        c3: number;
+        total: number;
+      }
+    | null = null;
+
+  for (const ln of aiLines) {
+    const counts = countOpponentWinStepPatterns3(ln.finalBoard, nextQueue, opponentNextIndex, target);
+
+    if (!best) {
+      best = { line: ln.line, ...counts };
+      continue;
+    }
+
+    // A: minimize total winning sequences
+    if (counts.total !== best.total) {
+      if (counts.total < best.total) best = { line: ln.line, ...counts };
+      continue;
+    }
+
+    // B: among ties, avoid 1-step wins first, then 2-step wins
+    if (counts.c1 !== best.c1) {
+      if (counts.c1 < best.c1) best = { line: ln.line, ...counts };
+      continue;
+    }
+    if (counts.c2 !== best.c2) {
+      if (counts.c2 < best.c2) best = { line: ln.line, ...counts };
+      continue;
+    }
+
+    // Perfect tie: slight randomness
+    if (rng() < 0.5) best = { line: ln.line, ...counts };
+  }
+
+  return best?.line ?? null;
+}
+
 export function getCpuMovePlan(input: {
   board: number[];
   target: number;
@@ -269,50 +369,30 @@ export function getCpuMovePlan(input: {
   const win2 = remaining >= 2 ? findWinAtStep(board, nextQueue, idx, target, 2) : null;
   const win3 = remaining >= 3 ? findWinAtStep(board, nextQueue, idx, target, 3) : null;
 
-  // 1) Difficulty-weighted checkmate choice
+  // 1) Attack priority (all difficulties):
+  // Choose the shortest finishing path (1-step > 2-step > 3-step).
+  if (win1) return { line: win1 };
+  if (win2) return { line: win2 };
+  if (win3) return { line: win3 };
+
+  // Defense depends on difficulty.
   if (d === "easy") {
-    if (win1) return { line: win1 };
-    if (win2 && rng() < 0.2) return { line: win2 };
     const line = chooseDefensiveLine(board, nextQueue, idx, target, remaining, 1, rng);
     return line ? { line } : null;
   }
-
   if (d === "normal") {
-    if (win1) return { line: win1 };
-    // Normal: 2-step 70%, 3-step 30% (when win1 is absent)
-    const r = rng();
-    if (win2 && win3) {
-      return r < 0.7 ? { line: win2 } : { line: win3 };
-    }
-    if (win2 && !win3) {
-      if (r < 0.7) return { line: win2 };
-    }
-    if (!win2 && win3) {
-      if (r < 0.3) return { line: win3 };
-    }
     const line = chooseDefensiveLine(board, nextQueue, idx, target, remaining, 2, rng);
     return line ? { line } : null;
   }
-
   if (d === "hard") {
-    if (win1) return { line: win1 };
-    if (win2) return { line: win2 };
-    // Hard: 3手詰みが見つかったら100%実行（ただしwin1/win2がある場合はそれを優先して3手詰みは残り得る）
-    if (win3) return { line: win3 };
-    // Hard defense:
-    // If we can't complete in 1/2/3 steps, prevent opponent from completing 1-step or 2-step win.
-    // This corresponds to opponentDepth=2 (i.e., "no win within next 2 actions").
+    // Prevent opponent from completing a 1-step or 2-step win in their next turn.
     const line = chooseDefensiveLine(board, nextQueue, idx, target, remaining, 2, rng);
     return line ? { line } : null;
   }
 
-  // god
+  // God:最悪ケース回避（512通りを手数別に評価）
   if (d === "god") {
-    // God: find 3-step mate 100% if possible.
-    if (win3) return { line: win3 };
-    if (win2) return { line: win2 };
-    if (win1) return { line: win1 };
-    const line = chooseDefensiveLine(board, nextQueue, idx, target, remaining, 3, rng);
+    const line = chooseGodDefensiveLine(board, nextQueue, idx, target, remaining, rng);
     return line ? { line } : null;
   }
 

@@ -12,7 +12,7 @@ type GameMode = "cpu" | "local" | "online";
 type CpuDifficulty = "easy" | "normal" | "hard" | "god";
 type TargetValue = number;
 type FirstTurn = "p1" | "p2" | "random";
-type Screen = "title" | "menu" | "settings" | "matching" | "play";
+type Screen = "title" | "menu" | "settings" | "onlineWaiting" | "matching" | "play";
 type TimeLimitChoice = "15" | "30" | "none";
 
 type OnlineRole = "host" | "guest";
@@ -459,6 +459,23 @@ export default function Page() {
   const [matchId, setMatchId] = useState<number | null>(null);
   const [matchNotFound, setMatchNotFound] = useState(false);
 
+  // Online waiting (room ID sync)
+  const [onlineWaitingRoomId, setOnlineWaitingRoomId] = useState<string>("");
+  const onlineStartOnceRef = useRef(false);
+
+  // Random match CPU fallback
+  const [cpuFallbackMessage, setCpuFallbackMessage] = useState<string | null>(null);
+  const randomFallbackTimeoutRef = useRef<number | null>(null);
+
+  // Humanize CPU turns (thought indicator + delay)
+  const [cpuThinking, setCpuThinking] = useState(false);
+
+  useEffect(() => {
+    if (!cpuFallbackMessage) return;
+    const id = window.setTimeout(() => setCpuFallbackMessage(null), 2500);
+    return () => window.clearTimeout(id);
+  }, [cpuFallbackMessage]);
+
   const [bgmVolume, setBgmVolume] = useState<number>(70);
   const [seVolume, setSeVolume] = useState<number>(70);
 
@@ -506,6 +523,7 @@ export default function Page() {
   const cpuTimeoutRef = useRef<number | null>(null);
   const cpuPlannedLineRef = useRef<PlannedMove[] | null>(null);
   const onlineChannelRef = useRef<RealtimeChannel | null>(null);
+  const onlineClientIdRef = useRef<string>("");
   const matchChannelRef = useRef<RealtimeChannel | null>(null);
   const matchIdRef = useRef<number | null>(matchId);
   const isProcessingRef = useRef<boolean>(isProcessing);
@@ -718,6 +736,22 @@ export default function Page() {
     screen === "play" &&
     !isPaused;
 
+  const isOpponentTurn = useMemo(() => {
+    if (screen !== "play" || isPaused || winner) return false;
+    if (mode === "cpu") return currentPlayer === 2;
+    if (mode === "online") return !!online && online.player !== currentPlayer;
+    return false;
+  }, [screen, isPaused, winner, mode, currentPlayer, online]);
+
+  const showThinking = isOpponentTurn && (mode === "cpu" ? cpuThinking : true);
+
+  const onlineRoleLabel = useMemo(() => {
+    const myRole = menuOnlineRole;
+    const myText = myRole === "host" ? "ホスト" : "ゲスト";
+    const oppText = myRole === "host" ? "ゲスト" : "ホスト";
+    return { myText, oppText };
+  }, [menuOnlineRole]);
+
   const statusText = useMemo(() => {
     if (winner) return `${playerLabel(winner)} Wins!`;
     return `${playerLabel(currentPlayer)} Turn`;
@@ -801,6 +835,11 @@ export default function Page() {
   async function cancelMatchingAndBackToMenu() {
     matchingRunIdRef.current += 1; // cancel any in-flight matching loop
     playSe("modoru");
+    if (randomFallbackTimeoutRef.current) {
+      window.clearTimeout(randomFallbackTimeoutRef.current);
+      randomFallbackTimeoutRef.current = null;
+    }
+    setCpuFallbackMessage(null);
     await cleanupMatchRecord();
     await leaveMatchChannel();
     await leaveOnlineRoom();
@@ -815,7 +854,13 @@ export default function Page() {
       void leaveOnlineRoom();
     }
     window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onUnload);
+      if (randomFallbackTimeoutRef.current) {
+        window.clearTimeout(randomFallbackTimeoutRef.current);
+        randomFallbackTimeoutRef.current = null;
+      }
+    };
   }, []);
 
   function genRoomId() {
@@ -830,6 +875,53 @@ export default function Page() {
     setScreen("matching");
     setMatchNotFound(false);
     setMatchId(null);
+
+    // Rescue: after 15s without opponent, fallback to CPU (Normal/Hard)
+    const snapshotTarget = menuTarget;
+    if (randomFallbackTimeoutRef.current) {
+      window.clearTimeout(randomFallbackTimeoutRef.current);
+      randomFallbackTimeoutRef.current = null;
+    }
+    randomFallbackTimeoutRef.current = window.setTimeout(() => {
+      if (matchingRunIdRef.current !== runId) return;
+      randomFallbackTimeoutRef.current = null;
+      void (async () => {
+        // Cancel matching loop ASAP.
+        matchingRunIdRef.current += 1;
+        await cleanupMatchRecord();
+        await leaveMatchChannel();
+        await leaveOnlineRoom();
+
+        // Start CPU pseudo-online match.
+        const fallbackCpu: CpuDifficulty = Math.random() < 0.5 ? "normal" : "hard";
+        setCpuFallbackMessage("対戦相手が見つかりました！");
+        setTarget(snapshotTarget);
+        setMode("cpu");
+        setCpuDifficulty(fallbackCpu);
+        setStartingPlayer(1);
+        setCurrentPlayer(1);
+        setMovesLeft(TURN_ACTIONS);
+        setSelected(null);
+        setWinner(null);
+        setFlashIndex(null);
+        setConfetti([]);
+        setMoveOverlay(null);
+        setIsAnimatingMove(false);
+        completedOverlayIdRef.current = null;
+        setIsPaused(false);
+        setCpuThinking(false);
+
+        const rolled = rollFairInitialState(snapshotTarget);
+        const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+        setBoard(rolled.board);
+        setNextQueue(q);
+        setNextIndex(0);
+        setNextNumber(q[0]!);
+
+        setActionDeadlineMs(Date.now() + 30_000);
+        setScreen("play");
+      })();
+    }, 15_000);
 
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
@@ -860,6 +952,11 @@ export default function Page() {
           setMatchId(claimed.id);
           await joinOnlineRoom(claimed.room_id, "guest");
           if (matchingRunIdRef.current !== runId) return;
+          if (randomFallbackTimeoutRef.current) {
+            window.clearTimeout(randomFallbackTimeoutRef.current);
+            randomFallbackTimeoutRef.current = null;
+          }
+          setCpuFallbackMessage(null);
           setScreen("play");
           return;
         }
@@ -918,6 +1015,11 @@ export default function Page() {
             setIsAnimatingMove(false);
             completedOverlayIdRef.current = null;
             setIsPaused(false);
+            if (randomFallbackTimeoutRef.current) {
+              window.clearTimeout(randomFallbackTimeoutRef.current);
+              randomFallbackTimeoutRef.current = null;
+            }
+            setCpuFallbackMessage(null);
             setScreen("play");
 
             const rolled = rollFairInitialState(appliedTarget);
@@ -958,9 +1060,14 @@ export default function Page() {
     setMatchNotFound(true);
   }
 
-  async function joinOnlineRoom(roomId: string, role: OnlineRole) {
+  async function joinOnlineRoom(
+    roomId: string,
+    role: OnlineRole,
+    opts?: { onPresenceSync?: (channel: RealtimeChannel) => void },
+  ) {
     await leaveOnlineRoom();
     const clientId = getClientId();
+    onlineClientIdRef.current = clientId;
     const player: Player = role === "host" ? 1 : 2;
 
     const channel = supabase.channel(`plus-battle-room-${roomId}`, {
@@ -992,11 +1099,15 @@ export default function Page() {
       setNextIndex(typeof data.nextIndex === "number" ? data.nextIndex : 0);
       setNextNumber(typeof data.nextNumber === "number" ? data.nextNumber : randInt(1, 9));
       setOnline((o) => (o ? { ...o, ready: true } : o));
+      setScreen((s) => (s === "onlineWaiting" ? "play" : s));
     });
 
     channel.on("presence", { event: "sync" }, () => {
-      // no-op for now
+      opts?.onPresenceSync?.(channel);
     });
+
+    // Set immediately so presence callback can broadcast before `subscribe()` resolves.
+    onlineChannelRef.current = channel;
 
     await channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
@@ -1004,8 +1115,6 @@ export default function Page() {
         setOnline({ enabled: true, roomId, role, player, clientId, ready: role === "host" });
       }
     });
-
-    onlineChannelRef.current = channel;
   }
 
   async function broadcastOnlineState(nextState: {
@@ -1020,17 +1129,20 @@ export default function Page() {
     startingPlayer: Player;
     actionDeadlineMs?: number | null;
   }) {
-    if (!onlineChannelRef.current || !online) return;
+    if (!onlineChannelRef.current) return;
+    const clientId = onlineClientIdRef.current;
+    if (!clientId) return;
     await onlineChannelRef.current.send({
       type: "broadcast",
       event: "state",
-      payload: { ...nextState, clientId: online.clientId },
+      payload: { ...nextState, clientId },
     });
   }
 
   function startGame() {
     playSe("susumu");
     setUnlockMessage(null);
+    setCpuThinking(false);
     setShowGodVictory(false);
     setPendingWinner(null);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
@@ -1047,32 +1159,53 @@ export default function Page() {
       const roomId = (menuRoomId || "").trim();
       if (!roomId) return;
       setTimeLimitMs(appliedLimit);
-      void joinOnlineRoom(roomId, menuOnlineRole).then(() => {
-        setTarget(appliedTarget);
-        setMode("online");
-        setCpuDifficulty("easy");
-        setStartingPlayer(1);
-        setCurrentPlayer(1);
-        setMovesLeft(TURN_ACTIONS);
-        setSelected(null);
-        setWinner(null);
-        setFlashIndex(null);
-        setConfetti([]);
-        setMoveOverlay(null);
-        setIsAnimatingMove(false);
-        completedOverlayIdRef.current = null;
-        setIsPaused(false);
-        setScreen("play");
+      setOnlineWaitingRoomId(roomId);
+      onlineStartOnceRef.current = false;
+      setScreen("onlineWaiting");
 
-        if (menuOnlineRole === "host") {
+      void joinOnlineRoom(roomId, menuOnlineRole, {
+        onPresenceSync: (ch) => {
+          if (menuOnlineRole !== "host") return; // only host decides when to start
+          if (onlineStartOnceRef.current) return;
+
+          // Detect both players (1 and 2) in presence.
+          const state = ch.presenceState() as Record<string, Array<{ player?: Player }>>;
+          const players = new Set<number>();
+          for (const entries of Object.values(state)) {
+            for (const e of entries ?? []) {
+              if (typeof e.player === "number") players.add(e.player);
+            }
+          }
+          if (!players.has(1) || !players.has(2)) return;
+
+          onlineStartOnceRef.current = true;
+
           const rolled = rollFairInitialState(appliedTarget);
           const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+          setTarget(appliedTarget);
+          setMode("online");
+          setCpuDifficulty("easy");
+          setStartingPlayer(1);
+          setCurrentPlayer(1);
+          setMovesLeft(TURN_ACTIONS);
+          setSelected(null);
+          setWinner(null);
+          setFlashIndex(null);
+          setConfetti([]);
+          setMoveOverlay(null);
+          setIsAnimatingMove(false);
+          completedOverlayIdRef.current = null;
+          setIsPaused(false);
           setBoard(rolled.board);
           setNextQueue(q);
           setNextIndex(0);
           setNextNumber(q[0]!);
+
           const deadline = appliedLimit === null ? null : Date.now() + appliedLimit;
           setActionDeadlineMs(deadline);
+          // Move both players to play state.
+          setScreen("play");
+
           void broadcastOnlineState({
             target: appliedTarget,
             board: rolled.board,
@@ -1085,15 +1218,7 @@ export default function Page() {
             startingPlayer: 1,
             actionDeadlineMs: deadline,
           });
-        } else {
-          // guest waits for host state
-          setBoard(makeInitialBoard());
-          const q = Array.from({ length: 80 }, () => randInt(1, 9));
-          setNextQueue(q);
-          setNextIndex(0);
-          setNextNumber(q[0]!);
-          setActionDeadlineMs(null);
-        }
+        },
       });
       return;
     }
@@ -1128,6 +1253,11 @@ export default function Page() {
   function backToMenu() {
     if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
     if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+    if (randomFallbackTimeoutRef.current) {
+      window.clearTimeout(randomFallbackTimeoutRef.current);
+      randomFallbackTimeoutRef.current = null;
+    }
+    setCpuFallbackMessage(null);
     playSe("modoru");
     setIsPaused(false);
     setUnlockMessage(null);
@@ -1561,7 +1691,10 @@ export default function Page() {
 
     if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
 
+    setCpuThinking(true);
+    const randomDelayMs = 1500 + Math.floor(Math.random() * 2501); // 1500-4000ms
     cpuTimeoutRef.current = window.setTimeout(() => {
+      setCpuThinking(false);
       if (modeRef.current !== "cpu") return;
       if (winnerRef.current) return;
       if (currentPlayerRef.current !== 2) return;
@@ -1573,10 +1706,12 @@ export default function Page() {
 
       setSelected(null);
       startMove(planned.from, planned.to);
-    }, 1000);
+    }, randomDelayMs);
 
     return () => {
       if (cpuTimeoutRef.current) window.clearTimeout(cpuTimeoutRef.current);
+      cpuTimeoutRef.current = null;
+      setCpuThinking(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCpuTurn, isAnimatingMove, movesLeft, board, nextNumber, nextIndex, cpuDifficulty]);
@@ -2128,7 +2263,7 @@ export default function Page() {
               </button>
               <div className="text-xs font-black tracking-[0.25em] text-zinc-500">MATCHING</div>
               <div className="text-3xl font-black tracking-tight text-zinc-900">対戦相手を探しています...</div>
-              <div className="text-sm font-semibold text-zinc-600">最大30秒ほどかかる場合があります</div>
+              <div className="text-sm font-semibold text-zinc-600">最大15秒ほどかかる場合があります</div>
               <motion.div
                 className="h-3 w-64 overflow-hidden rounded-full border border-white/70 bg-white/80"
                 initial={false}
@@ -2157,7 +2292,47 @@ export default function Page() {
               )}
             </div>
           </motion.div>
-        ) : (
+        ) : screen === "onlineWaiting" ? (
+        <motion.div
+          key="onlineWaiting"
+          className="w-full"
+          initial={{ opacity: 0, y: 10, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -10, scale: 0.98 }}
+          transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
+        >
+          <div className="relative flex flex-col items-center gap-6 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-7 text-center shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px]">
+            <button
+              type="button"
+              onClick={() => backToMenu()}
+              className="absolute left-4 top-4 rounded-2xl border border-white/70 bg-white/85 px-4 py-2 text-xs font-black text-zinc-800 shadow-[0_14px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.12)] transition-transform hover:brightness-105 active:scale-[0.98]"
+            >
+              戻る（キャンセル）
+            </button>
+            <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ONLINE</div>
+            <div className="text-3xl font-black tracking-tight text-zinc-900">相手を待っています...</div>
+            <div className="text-sm font-semibold text-zinc-600">Room ID: {onlineWaitingRoomId}</div>
+            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+              <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                あなた: {onlineRoleLabel.myText}
+              </div>
+              <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                相手: {onlineRoleLabel.oppText}
+              </div>
+            </div>
+            <motion.div
+              className="h-3 w-64 overflow-hidden rounded-full border border-white/70 bg-white/80"
+              initial={false}
+            >
+              <motion.div
+                className="h-full bg-gradient-to-r from-sky-300 to-fuchsia-300"
+                animate={{ x: ["-40%", "120%"] }}
+                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+              />
+            </motion.div>
+          </div>
+        </motion.div>
+      ) : (
         <motion.div
           key="play"
           className="w-full"
@@ -2172,6 +2347,21 @@ export default function Page() {
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <div className="flex flex-wrap items-baseline gap-3">
                   <div className="text-2xl font-black tracking-tight sm:text-3xl md:text-4xl">{statusText}</div>
+                  {mode === "online" && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                        あなた: {onlineRoleLabel.myText}
+                      </div>
+                      <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                        相手: {onlineRoleLabel.oppText}
+                      </div>
+                    </div>
+                  )}
+                  {showThinking && (
+                    <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                      相手が考え中...
+                    </div>
+                  )}
                   {!winner && (
                     <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-700 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
                       {movesLeftText}
@@ -2210,6 +2400,18 @@ export default function Page() {
                       transition={{ duration: 0.12, ease: "linear" }}
                     />
                   </div>
+                )}
+                {cpuFallbackMessage && (
+                  <motion.div
+                    key="cpu-fallback"
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 6 }}
+                    transition={{ duration: 0.2 }}
+                    className="rounded-[18px] border border-emerald-200/80 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-900 shadow-[0_14px_30px_rgba(16,185,129,.10)]"
+                  >
+                    {cpuFallbackMessage}
+                  </motion.div>
                 )}
                 <div className="text-sm font-semibold text-zinc-600 md:text-base">
                   隣接する2マスをタップして合体。合計が{" "}
