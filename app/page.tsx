@@ -3260,13 +3260,13 @@ export default function Page() {
         ) : screen === "menu" ? (
           <motion.div
             key="menu"
-            className="w-full min-h-[100dvh] overflow-y-auto pb-10"
+            className="w-full min-h-[100dvh] overflow-y-auto py-4 pb-10"
             initial={{ opacity: 0, y: 10, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex flex-col gap-3 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
+            <div className="mx-auto flex w-full max-w-[min(90vw,400px)] flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-5">
               <header className="space-y-1 flex-shrink-0">
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <motion.div
@@ -3322,7 +3322,7 @@ export default function Page() {
 
               <div className="grid gap-2 p-4 md:grid-cols-2">
                 <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
-                  <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center justify-center gap-3">
                     <div className="text-xs font-black tracking-widest text-zinc-700">対戦モード</div>
                     <div className="flex items-center gap-2 text-[10px] font-black text-zinc-600">
                       <JellyImage src="/images/vs_player.png" alt="対人" ring="rgba(255,170,210,.95)" size={34} />
@@ -3463,7 +3463,7 @@ export default function Page() {
 
                 {menuMode === "cpu" && (
                   <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
-                    <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center justify-center gap-3">
                       <div className="text-xs font-black tracking-widest text-zinc-700">難易度</div>
                       <div className="flex items-center gap-2">
                         <JellyImage src="/images/easy.png" alt="Easy" ring="rgba(255,220,120,.95)" size={34} />
@@ -3699,7 +3699,7 @@ export default function Page() {
       ) : (
         <motion.div
           key="play"
-          className="w-full min-h-[100dvh] overflow-y-auto pb-20 pb-[env(safe-area-inset-bottom)]"
+          className="w-full min-h-[100dvh] overflow-y-auto py-4 pb-20 pb-[env(safe-area-inset-bottom)]"
           initial={{ opacity: 0, y: 10, scale: 0.98 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -10, scale: 0.98 }}
@@ -3707,12 +3707,12 @@ export default function Page() {
         >
           <div
             className={[
-              "flex flex-col gap-4 rounded-[36px] border border-white/70 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] md:gap-6 md:rounded-[40px] md:p-6",
+              "mx-auto flex w-full max-w-[min(90vw,400px)] flex-col gap-4 rounded-[36px] border border-white/70 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] md:gap-6 md:rounded-[40px] md:p-6",
               isIOSSafari ? "bg-white/90" : "bg-gradient-to-b from-white/75 to-white/55 backdrop-blur",
             ].join(" ")}
             style={{ willChange: "transform" }}
           >
-            <header className="flex flex-shrink-0 flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <header className="flex flex-shrink-0 flex-col items-center justify-center gap-4 sm:flex-row sm:items-end sm:justify-between">
               <div className="space-y-2">
                 <div className="flex w-full items-center justify-between gap-3">
                   <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
@@ -3925,7 +3925,7 @@ export default function Page() {
                 <div className="flex w-full items-center justify-center">
                   <div className="flex w-full max-w-[560px] flex-col items-center justify-center gap-4 sm:flex-row sm:items-center sm:justify-center sm:gap-8">
                   <div className="w-full max-w-sm rounded-3xl border border-white/70 bg-white/72 p-3 shadow-[0_16px_34px_rgba(90,60,160,.12)] sm:order-2 sm:w-[170px] sm:max-w-none">
-                    <div className="flex items-end justify-between gap-3 sm:flex-col sm:items-start">
+                    <div className="flex items-end justify-center gap-3 sm:flex-col sm:items-start">
                       <div className="text-xs font-black tracking-widest text-zinc-500">NEXT</div>
                       <div className="text-[10px] font-black text-zinc-500">自動で補充</div>
                     </div>
@@ -3941,7 +3941,7 @@ export default function Page() {
 
                   <div className="flex w-full max-h-[60dvh] items-center justify-center sm:order-1">
                 <div className="relative mx-auto aspect-square w-full max-w-[400px] touch-none overscroll-contain" ref={boardWrapRef}>
-                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-6 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-8">
+                  <div className="grid h-full w-full grid-cols-2 grid-rows-2 gap-2 rounded-[36px] border border-white/70 bg-white/65 p-2 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-8">
                     {board.map((value, idx) => {
                       const isSelected = selected === idx;
                       const isFlashing = flashIndex === idx;
