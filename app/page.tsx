@@ -76,6 +76,8 @@ type OnlineBroadcastState = {
   winner: Winner;
   startingPlayer: Player;
   actionDeadlineMs?: number | null;
+  // 勝利確定時の理由（25ゴール演出のディレイ有無などに使う）
+  winReason?: "goal" | "surrender";
 };
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -856,6 +858,7 @@ export default function Page() {
   const cpuDifficultyRef = useRef<CpuDifficulty>(cpuDifficulty);
   const targetRef = useRef<number>(target);
   const winnerRef = useRef<Winner>(winner);
+  const pendingWinnerRef = useRef<Winner>(pendingWinner);
   const timeLimitMsRef = useRef<number | null>(timeLimitMs);
   const matchTypeRef = useRef<"random" | "room" | null>(matchType);
   const cpuTimeoutRef = useRef<number | null>(null);
@@ -1100,6 +1103,9 @@ export default function Page() {
     winnerRef.current = winner;
   }, [winner]);
   useEffect(() => {
+    pendingWinnerRef.current = pendingWinner;
+  }, [pendingWinner]);
+  useEffect(() => {
     matchIdRef.current = matchId;
   }, [matchId]);
 
@@ -1110,11 +1116,16 @@ export default function Page() {
   }, [isPaused]);
 
   useEffect(() => {
+    // タイマー表示（timeLeftMs）のための nowMs 更新。
+    // ターンごとに setInterval を増殖させないよう、開始条件/cleanup を useEffect 側で一元管理します。
+    if (screen !== "play" || isPaused || winner) return;
     const t = window.setInterval(() => setNowMs(Date.now()), 120);
     return () => window.clearInterval(t);
-  }, []);
+  }, [screen, isPaused, winner]);
 
-  const isCpuTurn = mode === "cpu" && currentPlayer === 2 && winner === null && screen === "play" && !isPaused;
+  // pendingWinner が非 null の間は「勝敗演出待ち」なので、CPUの思考/自動操作を止める
+  const isCpuTurn =
+    mode === "cpu" && currentPlayer === 2 && winner === null && pendingWinner === null && screen === "play" && !isPaused;
 
   const nextPair = useMemo(() => {
     const q = nextQueue;
@@ -1663,7 +1674,14 @@ export default function Page() {
       setCurrentPlayer(data.currentPlayer);
       setMovesLeft(data.movesLeft);
       setTurns(typeof data.turns === "number" ? data.turns : 1);
-      setWinner(data.winner);
+      // winner 確定時は即 setWinner せず、win() の pendingWinner を経由させて
+      // 25ゴール演出のディレイと「二重処理の停止」を揃えます。
+      if (data.winner !== null) {
+        const delayForGoal = data.winReason === "goal" && targetRef.current === 25 ? 1500 + Math.floor(Math.random() * 501) : 500;
+        win(data.winner, delayForGoal);
+      } else {
+        setWinner(null);
+      }
       if ("actionDeadlineMs" in data) setActionDeadlineMs(typeof data.actionDeadlineMs === "number" ? data.actionDeadlineMs : null);
       setFlashIndex(null);
       setSelected(null);
@@ -1732,6 +1750,7 @@ export default function Page() {
     winner: Winner;
     startingPlayer: Player;
     actionDeadlineMs?: number | null;
+    winReason?: "goal" | "surrender";
   }) {
     if (!onlineChannelRef.current) return;
     const clientId = onlineClientIdRef.current;
@@ -1971,8 +1990,12 @@ export default function Page() {
     flashTimeoutRef.current = window.setTimeout(() => setFlashIndex(null), 420);
   }
 
-  function win(p: Player) {
+  function win(p: Player, delayMs: number = 500) {
+    // すでに勝敗が確定/演出中の場合は二重処理を防ぐ
+    if (winnerRef.current || pendingWinnerRef.current) return;
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
+    // pendingWinner は「勝利演出中の入力ロック」にも使うため、ref と state を即時同期する
+    pendingWinnerRef.current = p;
     setPendingWinner(p);
     setSelected(null);
     setConfetti(makeConfetti(90));
@@ -1981,8 +2004,9 @@ export default function Page() {
     pendingWinnerTimeoutRef.current = window.setTimeout(() => {
       setWinner(p);
       setPendingWinner(null);
+      pendingWinnerRef.current = null;
       pendingWinnerTimeoutRef.current = null;
-    }, 500);
+    }, delayMs);
   }
 
   function surrenderOnline() {
@@ -2008,6 +2032,7 @@ export default function Page() {
         winner: opponent,
         startingPlayer,
         actionDeadlineMs: null,
+        winReason: "surrender",
       });
     }
   }
@@ -2140,12 +2165,32 @@ export default function Page() {
           if (mt !== "random" && mt !== "room") return;
           dbMatchType = mt;
 
-          if (!onlineOpponentUserId) return;
-          opponentUserIdForElo = onlineOpponentUserId;
+          // 降参直後など、Presence 同期のタイミングで `onlineOpponentUserId` が未確定のまま
+          // 勝敗確定になっても Elo/履歴保存が止まらないよう、Presence state から再取得します。
+          let opponentIdForElo = onlineOpponentUserId;
+          if (!opponentIdForElo) {
+            const ch = onlineChannelRef.current;
+            const presenceState = ch?.presenceState() as
+              | Record<string, Array<{ player?: Player; userId?: string; name?: string }>>
+              | undefined;
+            const otherPlayer: Player = online.player === 1 ? 2 : 1;
+            for (const entries of Object.values(presenceState ?? {})) {
+              for (const e of entries ?? []) {
+                if (e?.player === otherPlayer && typeof e?.userId === "string" && e.userId.trim()) {
+                  opponentIdForElo = e.userId.trim();
+                  break;
+                }
+              }
+              if (opponentIdForElo) break;
+            }
+          }
+
+          if (!opponentIdForElo) return;
+          opponentUserIdForElo = opponentIdForElo;
 
           const localIsPlayer1 = online.player === 1;
-          player1Id = localIsPlayer1 ? myUserId : onlineOpponentUserId;
-          player2Id = localIsPlayer1 ? onlineOpponentUserId : myUserId;
+          player1Id = localIsPlayer1 ? myUserId : opponentIdForElo;
+          player2Id = localIsPlayer1 ? opponentIdForElo : myUserId;
           winnerId = winner === 1 ? player1Id : player2Id;
         } else if (modeNow === "cpu") {
           // CPU はローカルのため Elo なし。ただし random 疑似オンラインだけ例外で Elo 更新する。
@@ -2318,32 +2363,55 @@ export default function Page() {
     setBoard(next);
     bumpForChanges(prev, next);
     if (shouldFlash) triggerFlash(to);
-    if (didWin) win(currentPlayerRef.current);
+    if (didWin) {
+      // 25（= GOAL）完成時は、最後の盤面を見せるため少しディレイして勝利確定へ寄せます。
+      // これにより、pendingWinner の間は入力/自動手が止まり二重処理も防げます。
+      const delayForWin = t === 25 ? 1500 + Math.floor(Math.random() * 501) : 500;
+      if (t === 25) triggerFlash(to); // 25になったマスを軽くフィードバック
+      win(currentPlayerRef.current, delayForWin);
+    }
     endTurnOrContinue(didWin);
     if (movesLeftRef.current - 1 <= 0) cpuPlannedLineRef.current = null;
 
-    // Reset action timer after a move completes
+    // タイマーは「ターン開始時」にのみ規定秒数を上書きする。
+    // ここで毎手リセットすると合計時間が伸びて表示が異常（例: 38秒など）になりやすい。
+    const afterMovesLeft = Math.max(0, movesLeftRef.current - 1);
+    const turnEnds = afterMovesLeft === 0;
     const limit = timeLimitMsRef.current;
-    const newDeadline = limit === null ? null : Date.now() + limit;
-    setActionDeadlineMs(newDeadline);
+    const nextTurnDeadline = limit === null ? null : Date.now() + limit;
+    if (modeRef.current === "online") {
+      if (didWin) {
+        // 勝敗確定前でも入力は pendingWinner で止まるが、タイマー暴走を避けるため null に寄せる
+        setActionDeadlineMs(null);
+      } else if (turnEnds) {
+        setActionDeadlineMs(nextTurnDeadline);
+      }
+    } else {
+      // ローカル/CPU は従来通り、手のたびにタイマーをリセットする挙動を維持
+      const newDeadline = limit === null ? null : Date.now() + limit;
+      setActionDeadlineMs(newDeadline);
+    }
 
     // Online sync (authoritative by active player)
     if (modeRef.current === "online" && online && online.player === currentPlayerRef.current) {
-      const afterMovesLeft = Math.max(0, movesLeftRef.current - 1);
-      const nextPlayer: Player = afterMovesLeft === 0 ? (currentPlayerRef.current === 1 ? 2 : 1) : currentPlayerRef.current;
-      const movesLeftNext = afterMovesLeft === 0 ? 2 : afterMovesLeft;
+      const nextPlayer: Player = turnEnds ? (currentPlayerRef.current === 1 ? 2 : 1) : currentPlayerRef.current;
+      const movesLeftNext = turnEnds ? TURN_ACTIONS : afterMovesLeft;
+      // turns/movesLeft/actionDeadlineMs を「次のターン状態」に合わせて送る
+      // （従来 movesLeft が 2 になっていたため、片側だけ「残り3回」/「残り2回」ズレが発生していました）
       void broadcastOnlineState({
         target: t,
         board: next,
         nextNumber: nextNum,
         nextQueue: q,
         nextIndex: idx,
-        currentPlayer: nextPlayer,
-        movesLeft: movesLeftNext,
+        currentPlayer: didWin ? currentPlayerRef.current : nextPlayer,
+        movesLeft: didWin ? 0 : movesLeftNext,
         turns: turnsRef.current,
         winner: didWin ? currentPlayerRef.current : null,
         startingPlayer,
-        actionDeadlineMs: newDeadline,
+        ...(didWin ? { winReason: "goal" } : {}),
+        // タイマーはターン開始時だけ更新する（turnEnds のときだけ actionDeadlineMs を含める）
+        ...(didWin ? { actionDeadlineMs: null as number | null } : turnEnds ? { actionDeadlineMs: nextTurnDeadline } : {}),
       });
     }
   }
@@ -2531,6 +2599,7 @@ export default function Page() {
   useEffect(() => {
     if (!isCpuTurn) return;
     if (winnerRef.current) return;
+    if (pendingWinnerRef.current) return; // 勝敗演出中は思考/自動操作を止める
     if (isAnimatingMove) return;
     if (movesLeftRef.current <= 0) return;
 
@@ -2575,7 +2644,8 @@ export default function Page() {
   }
 
   useEffect(() => {
-    if (screen !== "play" || isPaused || winner) return;
+    // 勝敗演出待ち（pendingWinner）中は盤面が確定していても操作/自動手が走ると二重処理になるため停止する
+    if (screen !== "play" || isPaused || winner || pendingWinnerRef.current) return;
     if (isAnimatingMove || moveOverlay) return;
     if (timeLeftMs === null) return;
     if (timeLeftMs > 0) return;
@@ -2587,7 +2657,7 @@ export default function Page() {
     setSelected(null);
     startMove(planned.from, planned.to);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode]);
+  }, [currentPlayer, isAnimatingMove, isPaused, moveOverlay, nowMs, online, screen, timeLeftMs, winner, mode, pendingWinner]);
 
   return (
     <main className="min-h-[100dvh] text-zinc-900">
@@ -3285,8 +3355,10 @@ export default function Page() {
             </button>
             <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ONLINE</div>
             <div className="text-3xl font-black tracking-tight text-zinc-900">
-              相手を待っています...{" "}
-              <span className="text-sm font-semibold text-zinc-600">(Room ID: {onlineWaitingRoomId})</span>
+              相手を待っています...
+              {matchType === "random" ? null : (
+                <span className="text-sm font-semibold text-zinc-600">(Room ID: {onlineWaitingRoomId})</span>
+              )}
             </div>
             <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
               <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
@@ -3303,7 +3375,8 @@ export default function Page() {
                   {playerName} (Rate: {playerRate})
                 </div>
                 <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                  {onlineOpponentName || "Opponent"} (Rate: {opponentRateForDisplay})
+                  {onlineOpponentName || "Opponent"} (
+                  Rate: {rateLoading || !onlineOpponentUserId ? "???" : opponentRateForDisplay})
                 </div>
               </div>
             )}
