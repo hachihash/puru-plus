@@ -466,9 +466,16 @@ export default function Page() {
   // Random match CPU fallback
   const [cpuFallbackMessage, setCpuFallbackMessage] = useState<string | null>(null);
   const randomFallbackTimeoutRef = useRef<number | null>(null);
+  const randomMatchResolvedRef = useRef(false);
 
   // Humanize CPU turns (thought indicator + delay)
   const [cpuThinking, setCpuThinking] = useState(false);
+
+  // Player name (stored locally; used for online presence + UI)
+  const [playerName, setPlayerName] = useState<string>(() => `Player_${randInt(1000, 9999)}`);
+  const [onlineOpponentName, setOnlineOpponentName] = useState<string>("");
+  // Random-match fallback CPU (a.k.a. "online-like" match for UI)
+  const [onlineBotFallback, setOnlineBotFallback] = useState<boolean>(false);
 
   useEffect(() => {
     if (!cpuFallbackMessage) return;
@@ -574,6 +581,26 @@ export default function Page() {
       // ignore
     }
   }, []);
+
+  useEffect(() => {
+    // Restore saved player name
+    try {
+      const raw = localStorage.getItem("plusBattlePlayerName");
+      const v = (raw ?? "").trim();
+      if (v) setPlayerName(v.slice(0, 16));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    // Persist player name
+    try {
+      localStorage.setItem("plusBattlePlayerName", playerName);
+    } catch {
+      // ignore
+    }
+  }, [playerName]);
 
   useEffect(() => {
     try {
@@ -745,6 +772,10 @@ export default function Page() {
 
   const showThinking = isOpponentTurn && (mode === "cpu" ? cpuThinking : true);
 
+  // online戦（ルーム/ランダム共通）時のUI切替用
+  // ※ランダムでBOTになった場合も menuMode が "online" になるので、ここで同じUI扱いにする
+  const isOnlineBattle = menuMode === "online" && screen === "play";
+
   const onlineRoleLabel = useMemo(() => {
     const myRole = menuOnlineRole;
     const myText = myRole === "host" ? "ホスト" : "ゲスト";
@@ -812,6 +843,8 @@ export default function Page() {
       onlineChannelRef.current = null;
     }
     setOnline(null);
+    setOnlineOpponentName("");
+    setOnlineBotFallback(false);
   }
 
   async function leaveMatchChannel() {
@@ -871,32 +904,48 @@ export default function Page() {
     playSe("susumu");
     const runId = matchingRunIdRef.current + 1;
     matchingRunIdRef.current = runId;
-    setTimeLimitMs(30_000); // random match is always 30s
+
+    // random match は常に30秒（UI文言/タイマー整合）
+    setTimeLimitMs(30_000);
+    setCpuThinking(false);
+    setOnlineBotFallback(false);
+    setCpuFallbackMessage(null);
+    setOnlineOpponentName("");
+    setMenuMode("online");
     setScreen("matching");
     setMatchNotFound(false);
     setMatchId(null);
+    onlineStartOnceRef.current = false;
+    randomMatchResolvedRef.current = false;
 
-    // Rescue: after 15s without opponent, fallback to CPU (Normal/Hard)
+    // 15秒成立しなければ必ずBOTへフォールバック
     const snapshotTarget = menuTarget;
     if (randomFallbackTimeoutRef.current) {
       window.clearTimeout(randomFallbackTimeoutRef.current);
       randomFallbackTimeoutRef.current = null;
     }
+
     randomFallbackTimeoutRef.current = window.setTimeout(() => {
       if (matchingRunIdRef.current !== runId) return;
       randomFallbackTimeoutRef.current = null;
+      // オンライン開始済みならフォールバックしない（念のため）
+      if (randomMatchResolvedRef.current) return;
+
       void (async () => {
-        // Cancel matching loop ASAP.
-        matchingRunIdRef.current += 1;
+        matchingRunIdRef.current += 1; // in-flight matching stop
         await cleanupMatchRecord();
         await leaveMatchChannel();
         await leaveOnlineRoom();
 
-        // Start CPU pseudo-online match.
         const fallbackCpu: CpuDifficulty = Math.random() < 0.5 ? "normal" : "hard";
+        const dummyOpponent = `Player_${randInt(1000, 9999)}`;
+
+        randomMatchResolvedRef.current = true;
         setCpuFallbackMessage("対戦相手が見つかりました！");
+        setOnlineOpponentName(dummyOpponent);
+        setOnlineBotFallback(true);
         setTarget(snapshotTarget);
-        setMode("cpu");
+        setMode("cpu"); // CPUロジックをそのまま使う（UIはonline扱い）
         setCpuDifficulty(fallbackCpu);
         setStartingPlayer(1);
         setCurrentPlayer(1);
@@ -917,24 +966,30 @@ export default function Page() {
         setNextQueue(q);
         setNextIndex(0);
         setNextNumber(q[0]!);
-
         setActionDeadlineMs(Date.now() + 30_000);
         setScreen("play");
       })();
     }, 15_000);
 
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-      if (matchingRunIdRef.current !== runId) return;
+    // --- Supabase キュー方式 ---
+    // Simultaneous start を吸収するため、waiting(host) を作った後も一定間隔で
+    // 「他の waiting を見つけて guest に切り替える」ことを続けます。
+    let hostQueueId: number | null = null;
+    let hostJoined = false;
+
+    while (matchingRunIdRef.current === runId && !randomMatchResolvedRef.current) {
       const { data: waiting } = await supabase
         .from("public_matches")
         .select("id,room_id,status")
         .eq("status", "waiting")
         .limit(1)
         .maybeSingle<PublicMatchRow>();
-      if (matchingRunIdRef.current !== runId) return;
 
-      if (waiting) {
+      if (matchingRunIdRef.current !== runId) return;
+      if (randomMatchResolvedRef.current) return;
+
+      // まずは待機中ルームがあれば参加（自分が作った waiting は除外）
+      if (waiting && waiting.id !== hostQueueId) {
         const { data: claimed } = await supabase
           .from("public_matches")
           .update({ status: "playing" })
@@ -942,65 +997,84 @@ export default function Page() {
           .eq("status", "waiting")
           .select("id,room_id,status")
           .maybeSingle<PublicMatchRow>();
-        if (matchingRunIdRef.current !== runId) return;
 
+        if (matchingRunIdRef.current !== runId) return;
         if (claimed && claimed.status === "playing") {
-          // We are guest (P2)
-          setMenuMode("online");
+          // 自分の waiting(host) を破棄して、guest として参加する
+          if (hostQueueId !== null && hostQueueId !== claimed.id) {
+            try {
+              await supabase.from("public_matches").delete().eq("id", hostQueueId);
+            } catch {
+              // best-effort
+            }
+          }
+
+          await leaveOnlineRoom();
+
+          setOnlineBotFallback(false);
+          setCpuFallbackMessage(null);
+          setOnlineOpponentName("");
           setMenuOnlineRole("guest");
           setMenuRoomId(claimed.room_id);
           setMatchId(claimed.id);
+          setOnlineWaitingRoomId(claimed.room_id);
+          setScreen("onlineWaiting");
+
           await joinOnlineRoom(claimed.room_id, "guest");
-          if (matchingRunIdRef.current !== runId) return;
-          if (randomFallbackTimeoutRef.current) {
-            window.clearTimeout(randomFallbackTimeoutRef.current);
-            randomFallbackTimeoutRef.current = null;
-          }
-          setCpuFallbackMessage(null);
-          setScreen("play");
           return;
         }
-        // Lost race: retry
-        continue;
       }
 
-      // No waiting: create and wait as host (P1)
-      const roomId = genRoomId();
-      const { data: created } = await supabase
-        .from("public_matches")
-        .insert({ room_id: roomId, status: "waiting" })
-        .select("id,room_id,status")
-        .maybeSingle<PublicMatchRow>();
-      if (matchingRunIdRef.current !== runId) return;
+      // waiting が無い（または自分の待機）なら、まだ host になっていない場合は作る
+      if (!hostJoined) {
+        const roomId = genRoomId();
+        const { data: created } = await supabase
+          .from("public_matches")
+          .insert({ room_id: roomId, status: "waiting" })
+          .select("id,room_id,status")
+          .maybeSingle<PublicMatchRow>();
 
-      if (!created) continue;
+        if (matchingRunIdRef.current !== runId) return;
+        if (!created) {
+          // 作成に失敗したら次ループへ（タイマー側がBOTへフォールバックする）
+          await new Promise((r) => setTimeout(r, 240));
+          continue;
+        }
 
-      setMenuMode("online");
-      setMenuOnlineRole("host");
-      setMenuRoomId(created.room_id);
-      setMatchId(created.id);
+        hostQueueId = created.id;
+        hostJoined = true;
+        setMenuOnlineRole("host");
+        setMenuRoomId(created.room_id);
+        setMatchId(created.id);
+        setOnlineWaitingRoomId(created.room_id);
+        setScreen("onlineWaiting");
 
-      // Listen for status -> playing
-      await leaveMatchChannel();
-      if (matchingRunIdRef.current !== runId) {
-        // best-effort: avoid leaving a waiting record behind
-        await cleanupMatchRecord();
-        return;
-      }
-      const mc = supabase
-        .channel(`plus-battle-match-${created.id}`)
-        .on(
-          "postgres_changes",
-          { event: "UPDATE", schema: "public", table: "public_matches", filter: `id=eq.${created.id}` },
-          async (payload) => {
-            if (matchingRunIdRef.current !== runId) return;
-            const row = payload.new as PublicMatchRow;
-            if (row.status !== "playing") return;
-            // Start online as host and broadcast initial state.
-            await joinOnlineRoom(row.room_id, "host");
-            if (matchingRunIdRef.current !== runId) return;
+        // ホストはPresenceで「2人揃った瞬間」に初期盤面を broadcast して開始する
+        await joinOnlineRoom(created.room_id, "host", {
+          onPresenceSync: (ch) => {
+            if (onlineStartOnceRef.current) return;
 
-            const appliedTarget = menuTarget;
+            const state = ch.presenceState() as Record<string, Array<{ player?: Player }>>;
+            const players = new Set<number>();
+            for (const entries of Object.values(state)) {
+              for (const e of entries ?? []) {
+                if (typeof e.player === "number") players.add(e.player);
+              }
+            }
+            if (!players.has(1) || !players.has(2)) return;
+
+            onlineStartOnceRef.current = true;
+            randomMatchResolvedRef.current = true;
+            if (randomFallbackTimeoutRef.current) {
+              window.clearTimeout(randomFallbackTimeoutRef.current);
+              randomFallbackTimeoutRef.current = null;
+              setCpuFallbackMessage(null);
+            }
+
+            const appliedTarget = snapshotTarget;
+            const rolled = rollFairInitialState(appliedTarget);
+            const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
+
             setTarget(appliedTarget);
             setMode("online");
             setCpuDifficulty("easy");
@@ -1015,24 +1089,16 @@ export default function Page() {
             setIsAnimatingMove(false);
             completedOverlayIdRef.current = null;
             setIsPaused(false);
-            if (randomFallbackTimeoutRef.current) {
-              window.clearTimeout(randomFallbackTimeoutRef.current);
-              randomFallbackTimeoutRef.current = null;
-            }
-            setCpuFallbackMessage(null);
-            setScreen("play");
-
-            const rolled = rollFairInitialState(appliedTarget);
-            const q = makeNextQueue(rolled.next0, rolled.next1, rolled.next2, 80);
             setBoard(rolled.board);
             setNextQueue(q);
             setNextIndex(0);
             setNextNumber(q[0]!);
 
-            const newDeadline = Date.now() + 30_000;
-            setActionDeadlineMs(newDeadline);
+            const deadline = Date.now() + 30_000;
+            setActionDeadlineMs(deadline);
+            setScreen("play");
 
-            await broadcastOnlineState({
+            void broadcastOnlineState({
               target: appliedTarget,
               board: rolled.board,
               nextNumber: q[0]!,
@@ -1042,22 +1108,15 @@ export default function Page() {
               movesLeft: TURN_ACTIONS,
               winner: null,
               startingPlayer: 1,
-              actionDeadlineMs: newDeadline,
+              actionDeadlineMs: deadline,
             });
           },
-        )
-        .subscribe();
-      matchChannelRef.current = mc;
+        });
+      }
 
-      // Join room channel early (optional but helps)
-      await joinOnlineRoom(created.room_id, "host");
-      if (matchingRunIdRef.current !== runId) return;
-      return;
+      // 少し待って再度キューを取りに行う
+      await new Promise((r) => setTimeout(r, 220));
     }
-
-    // timeout -> show "not found" and wait for user action
-    if (matchingRunIdRef.current !== runId) return;
-    setMatchNotFound(true);
   }
 
   async function joinOnlineRoom(
@@ -1069,6 +1128,8 @@ export default function Page() {
     const clientId = getClientId();
     onlineClientIdRef.current = clientId;
     const player: Player = role === "host" ? 1 : 2;
+    const myPlayer = player;
+    const otherPlayer: Player = myPlayer === 1 ? 2 : 1;
 
     const channel = supabase.channel(`plus-battle-room-${roomId}`, {
       config: { broadcast: { ack: true }, presence: { key: clientId } },
@@ -1100,9 +1161,30 @@ export default function Page() {
       setNextNumber(typeof data.nextNumber === "number" ? data.nextNumber : randInt(1, 9));
       setOnline((o) => (o ? { ...o, ready: true } : o));
       setScreen((s) => (s === "onlineWaiting" ? "play" : s));
+      if (randomFallbackTimeoutRef.current) {
+        // Random matchの開始が確定したので救済タイマーを止める
+        window.clearTimeout(randomFallbackTimeoutRef.current);
+        randomFallbackTimeoutRef.current = null;
+        setCpuFallbackMessage(null);
+        randomMatchResolvedRef.current = true;
+      }
     });
 
     channel.on("presence", { event: "sync" }, () => {
+      // Presenceから相手プレイヤー名を拾う（ホスト/ゲスト共通）
+      const state = channel.presenceState() as Record<string, Array<{ player?: Player; name?: string }>>;
+      let opponent = "";
+      for (const entries of Object.values(state)) {
+        for (const e of entries ?? []) {
+          if (e?.player === otherPlayer && typeof e?.name === "string" && e.name.trim()) {
+            opponent = e.name.trim();
+            break;
+          }
+        }
+        if (opponent) break;
+      }
+      if (opponent) setOnlineOpponentName(opponent);
+
       opts?.onPresenceSync?.(channel);
     });
 
@@ -1111,7 +1193,8 @@ export default function Page() {
 
     await channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
-        await channel.track({ role, player });
+        // `playerName` はローカル保存値。対戦相手に表示するため Presence に同梱する
+        await channel.track({ role, player, name: playerName });
         setOnline({ enabled: true, roomId, role, player, clientId, ready: role === "host" });
       }
     });
@@ -1143,6 +1226,8 @@ export default function Page() {
     playSe("susumu");
     setUnlockMessage(null);
     setCpuThinking(false);
+    setOnlineBotFallback(false);
+    setOnlineOpponentName("");
     setShowGodVictory(false);
     setPendingWinner(null);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
@@ -1272,6 +1357,8 @@ export default function Page() {
     void cleanupMatchRecord();
     void leaveMatchChannel();
     void leaveOnlineRoom();
+    setOnlineOpponentName("");
+    setOnlineBotFallback(false);
     setScreen("menu");
   }
 
@@ -1343,6 +1430,32 @@ export default function Page() {
       setPendingWinner(null);
       pendingWinnerTimeoutRef.current = null;
     }, 500);
+  }
+
+  function surrenderOnline() {
+    // 降参: 自分が負ける => 相手が勝つ
+    if (winnerRef.current) return;
+    const me = currentPlayerRef.current;
+    const opponent: Player = me === 1 ? 2 : 1;
+
+    // 状態を即座に勝利演出へ寄せる（pendingWinner を使って入力も止める）
+    win(opponent);
+
+    // 可能なら相手へも勝敗確定をブロードキャストして同期する
+    if (modeRef.current === "online" && onlineChannelRef.current) {
+      void broadcastOnlineState({
+        target: targetRef.current,
+        board: boardRef.current,
+        nextNumber: nextNumberRef.current,
+        nextQueue: nextQueueRef.current,
+        nextIndex: nextIndexRef.current,
+        currentPlayer: opponent,
+        movesLeft: 0,
+        winner: opponent,
+        startingPlayer,
+        actionDeadlineMs: null,
+      });
+    }
   }
 
   useEffect(() => {
@@ -1872,6 +1985,19 @@ export default function Page() {
                 <div className="text-3xl font-black tracking-tight text-zinc-900">音量設定</div>
               </div>
 
+              <div className="rounded-[28px] border border-white/70 bg-white/75 p-4 text-left">
+                <div className="text-sm font-black text-zinc-700">プレイヤー名</div>
+                <div className="mt-1 text-xs font-semibold text-zinc-600">オンライン対戦で表示されます</div>
+                <input
+                  type="text"
+                  value={playerName}
+                  onChange={(e) => setPlayerName(e.target.value)}
+                  placeholder="Player_1234"
+                  maxLength={16}
+                  className="mt-3 w-full rounded-2xl border border-white/70 bg-white/90 px-4 py-3 text-sm font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.3)_inset]"
+                />
+              </div>
+
               <div className="grid w-full gap-6 sm:grid-cols-2">
                 <div className="rounded-[28px] border border-white/70 bg-white/75 p-4">
                   <div className="text-sm font-black text-zinc-700">BGM音量</div>
@@ -2310,8 +2436,10 @@ export default function Page() {
               戻る（キャンセル）
             </button>
             <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ONLINE</div>
-            <div className="text-3xl font-black tracking-tight text-zinc-900">相手を待っています...</div>
-            <div className="text-sm font-semibold text-zinc-600">Room ID: {onlineWaitingRoomId}</div>
+            <div className="text-3xl font-black tracking-tight text-zinc-900">
+              相手を待っています...{" "}
+              <span className="text-sm font-semibold text-zinc-600">(Room ID: {onlineWaitingRoomId})</span>
+            </div>
             <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
               <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
                 あなた: {onlineRoleLabel.myText}
@@ -2347,14 +2475,9 @@ export default function Page() {
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <div className="flex flex-wrap items-baseline gap-3">
                   <div className="text-2xl font-black tracking-tight sm:text-3xl md:text-4xl">{statusText}</div>
-                  {mode === "online" && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                        あなた: {onlineRoleLabel.myText}
-                      </div>
-                      <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
-                        相手: {onlineRoleLabel.oppText}
-                      </div>
+                  {isOnlineBattle && (
+                    <div className="rounded-[999px] border border-white/70 bg-white/75 px-3 py-1 text-xs font-black text-zinc-800 shadow-[0_12px_0_rgba(255,255,255,.7)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                      {playerName} vs {onlineOpponentName || "Opponent"}
                     </div>
                   )}
                   {showThinking && (
@@ -2424,21 +2547,36 @@ export default function Page() {
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => setIsPaused(true)}
-                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                >
-                  ポーズ
-                </button>
+                {!isOnlineBattle ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setIsPaused(true)}
+                      className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                    >
+                      ポーズ
+                    </button>
 
-                <button
-                  type="button"
-                  onClick={backToMenu}
-                  className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
-                >
-                  モード選択へ
-                </button>
+                    <button
+                      type="button"
+                      onClick={backToMenu}
+                      className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                    >
+                      モード選択へ
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playSe("modoru");
+                      surrenderOnline();
+                    }}
+                    className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
+                  >
+                    降参
+                  </button>
+                )}
 
                 {!winner && (
                   <button
@@ -2457,42 +2595,69 @@ export default function Page() {
                 )}
 
                 <div className="flex items-center gap-2 rounded-3xl border border-white/70 bg-white/75 px-3 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
-                  <JellyImage
-                    src={mode === "local" ? "/images/vs_player.png" : mode === "cpu" ? "/images/vs_cpu.png" : "/images/vs_online.png"}
-                    alt="mode"
-                    ring={mode === "local" ? "rgba(255,170,210,.95)" : mode === "cpu" ? "rgba(150,200,255,.95)" : "rgba(160,255,210,.95)"}
-                    size={38}
-                  />
-                  {mode === "cpu" ? (
-                    <JellyImage
-                      src={
-                        cpuDifficulty === "easy"
-                          ? "/images/easy.png"
-                          : cpuDifficulty === "normal"
-                            ? "/images/normal.png"
-                            : cpuDifficulty === "hard"
-                              ? "/images/hard.png"
-                              : "/images/god.png"
-                      }
-                      alt="difficulty"
-                      ring={
-                        cpuDifficulty === "easy"
-                          ? "rgba(255,220,120,.95)"
-                          : cpuDifficulty === "normal"
-                            ? "rgba(150,200,255,.95)"
-                            : cpuDifficulty === "hard"
-                              ? "rgba(210,160,255,.95)"
-                              : "rgba(255,170,120,.95)"
-                      }
-                      size={38}
-                    />
-                  ) : null}
-                  <div className="leading-tight">
-                    <div className="text-[10px] font-black tracking-widest text-zinc-600">MODE</div>
-                    <div className="text-xs font-black text-zinc-800">
-                      {mode === "local" ? "対人" : mode === "cpu" ? `CPU / ${cpuDifficulty.toUpperCase()}` : "オンライン"}
-                    </div>
-                  </div>
+                  {isOnlineBattle ? (
+                    <>
+                      <JellyImage
+                        src="/images/vs_online.png"
+                        alt="online"
+                        ring="rgba(160,255,210,.95)"
+                        size={38}
+                      />
+                      <div className="leading-tight">
+                        <div className="text-[10px] font-black tracking-widest text-zinc-600">VS</div>
+                        <div className="text-xs font-black text-zinc-800">
+                          {playerName} vs {onlineOpponentName || "Opponent"}
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <JellyImage
+                        src={
+                          mode === "local" ? "/images/vs_player.png" : mode === "cpu" ? "/images/vs_cpu.png" : "/images/vs_online.png"
+                        }
+                        alt="mode"
+                        ring={
+                          mode === "local"
+                            ? "rgba(255,170,210,.95)"
+                            : mode === "cpu"
+                              ? "rgba(150,200,255,.95)"
+                              : "rgba(160,255,210,.95)"
+                        }
+                        size={38}
+                      />
+                      {mode === "cpu" && !onlineBotFallback ? (
+                        <JellyImage
+                          src={
+                            cpuDifficulty === "easy"
+                              ? "/images/easy.png"
+                              : cpuDifficulty === "normal"
+                                ? "/images/normal.png"
+                                : cpuDifficulty === "hard"
+                                  ? "/images/hard.png"
+                                  : "/images/god.png"
+                          }
+                          alt="difficulty"
+                          ring={
+                            cpuDifficulty === "easy"
+                              ? "rgba(255,220,120,.95)"
+                              : cpuDifficulty === "normal"
+                                ? "rgba(150,200,255,.95)"
+                                : cpuDifficulty === "hard"
+                                  ? "rgba(210,160,255,.95)"
+                                  : "rgba(255,170,120,.95)"
+                          }
+                          size={38}
+                        />
+                      ) : null}
+                      <div className="leading-tight">
+                        <div className="text-[10px] font-black tracking-widest text-zinc-600">MODE</div>
+                        <div className="text-xs font-black text-zinc-800">
+                          {mode === "local" ? "対人" : mode === "cpu" ? `CPU / ${cpuDifficulty.toUpperCase()}` : "オンライン"}
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 <div className="rounded-3xl border border-white/70 bg-white/75 px-4 py-3 shadow-[0_12px_30px_rgba(80,60,130,.10)]">
@@ -2802,18 +2967,20 @@ export default function Page() {
                 >
                   リセット
                 </motion.button>
-                <motion.button
-                  type="button"
-                  onClick={() => {
-                    setIsPaused(false);
-                    backToMenu();
-                  }}
-                  className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:py-3"
-                  whileHover={{ y: -1 }}
-                  whileTap={{ scale: 0.98 }}
-                >
-                  モード選択へ
-                </motion.button>
+                {!isOnlineBattle && (
+                  <motion.button
+                    type="button"
+                    onClick={() => {
+                      setIsPaused(false);
+                      backToMenu();
+                    }}
+                    className="rounded-3xl border border-white/70 bg-white/85 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:py-3"
+                    whileHover={{ y: -1 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    モード選択へ
+                  </motion.button>
+                )}
               </div>
             </motion.div>
           </div>
