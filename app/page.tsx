@@ -4176,17 +4176,8 @@ export default function Page() {
 
                       <button
                         type="button"
-                        onClick={() => {
-                          // 1. 効果音を鳴らす
-                          playSe("modoru");
-                        
-                          // 2. 通信やタイマーを即座に停止（もしあれば）
-                          // stopAllProcess(); 
-    
-                          // 3. 強制リロード遷移でメモリをクリア
-                          window.location.href = '/';
-                        }}
-                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3" // ここは元のクラス名のままでOK
+                        onClick={backToMenu}
+                        className="rounded-3xl border border-white/70 bg-white/80 px-5 py-4 text-sm font-black text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98] md:px-4 md:py-3"
                       >
                         モード選択へ
                       </button>
@@ -4491,10 +4482,7 @@ export default function Page() {
                 <div className="mt-6 flex flex-wrap justify-center gap-3">
                   <motion.button
                     type="button"
-                    onClick={() => {
-                      // iPhoneの重さを解消するため、メモリを一度完全にクリアして遷移させる
-                      window.location.href = '/mode-selection';
-                    }}
+                    onClick={backToMenu}
                     className="rounded-3xl bg-gradient-to-r from-amber-400 to-yellow-300 px-6 py-3 text-sm font-black text-zinc-900 shadow-[0_18px_30px_rgba(120,70,40,.22)] transition-transform hover:brightness-105 active:scale-[0.98]"
                     whileHover={{ y: -1 }}
                     whileTap={{ scale: 0.98 }}
