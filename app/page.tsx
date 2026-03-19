@@ -3223,13 +3223,13 @@ export default function Page() {
         ) : screen === "menu" ? (
           <motion.div
             key="menu"
-            className="w-full"
+            className="w-full min-h-[100dvh] overflow-y-auto pb-10"
             initial={{ opacity: 0, y: 10, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -10, scale: 0.98 }}
             transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
           >
-            <div className="flex h-full min-h-0 flex-col gap-3 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
+            <div className="flex flex-col gap-3 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:rounded-[40px] md:p-5">
               <header className="space-y-1 flex-shrink-0">
                 <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
                 <motion.div
@@ -3283,7 +3283,7 @@ export default function Page() {
                 </div>
               </header>
 
-              <div className="grid flex-grow gap-2 overflow-y-auto pr-1 md:grid-cols-2">
+              <div className="grid gap-2 p-4 md:grid-cols-2">
                 <div className="rounded-[30px] border border-white/70 bg-gradient-to-b from-white/80 to-white/60 p-3 shadow-[0_22px_60px_rgba(120,70,40,.16)]">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-xs font-black tracking-widest text-zinc-700">対戦モード</div>
@@ -3531,7 +3531,7 @@ export default function Page() {
                 )}
               </div>
 
-              <div className="mt-auto flex flex-col gap-2 pb-[env(safe-area-inset-bottom)] p-4">
+              <div className="mt-2 flex flex-col gap-2 p-4 pb-[max(env(safe-area-inset-bottom),1rem)]">
                 <button
                   type="button"
                   onClick={startRandomMatch}
@@ -3662,14 +3662,14 @@ export default function Page() {
       ) : (
         <motion.div
           key="play"
-          className="w-full"
+          className="w-full h-[100dvh] flex flex-col overflow-hidden p-2 pb-[env(safe-area-inset-bottom)]"
           initial={{ opacity: 0, y: 10, scale: 0.98 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -10, scale: 0.98 }}
           transition={{ type: "spring", stiffness: 520, damping: 42, mass: 0.9 }}
         >
-          <div className="flex flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-6">
-            <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex h-full flex-col gap-4 rounded-[36px] border border-white/70 bg-gradient-to-b from-white/75 to-white/55 p-3 shadow-[0_26px_90px_rgba(120,70,40,.18)] backdrop-blur md:gap-6 md:rounded-[40px] md:p-6">
+            <header className="flex flex-shrink-0 flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
               <div className="space-y-2">
                 <div className="flex w-full items-center justify-between gap-3">
                   <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ぷるぷらす（Puru Plus）</div>
@@ -3857,7 +3857,7 @@ export default function Page() {
               </div>
             </header>
 
-            <section className="flex w-full flex-1 flex-col items-center gap-3 md:gap-5 md:flex-row md:items-start md:justify-center">
+            <section className="flex w-full flex-1 flex-col items-center gap-3 overflow-hidden md:gap-5 md:flex-row md:items-start md:justify-center">
               <div className="flex w-full flex-col items-center gap-4 md:max-w-[520px]">
                 {!winner && (
                   <div className="w-full max-w-sm">
@@ -3878,7 +3878,8 @@ export default function Page() {
                   </div>
                 )}
 
-                <div className="relative touch-none overscroll-contain" ref={boardWrapRef}>
+                <div className="flex w-full max-h-[60dvh] flex-1 items-center justify-center">
+                <div className="relative aspect-square w-[min(100%,60dvh)] touch-none overscroll-contain" ref={boardWrapRef}>
                   <div className="grid grid-cols-2 gap-3 rounded-[36px] border border-white/70 bg-white/65 p-3 shadow-[0_18px_60px_rgba(90,60,160,.14)] md:gap-4 md:rounded-[44px] md:p-4">
                     {board.map((value, idx) => {
                       const isSelected = selected === idx;
@@ -4081,10 +4082,11 @@ export default function Page() {
                     )}
                   </AnimatePresence>
                 </div>
+                </div>
 
               </div>
 
-              <aside className="mt-2 flex w-full flex-col items-center gap-4 md:mt-0 md:max-w-[360px] md:items-stretch">
+              <aside className="mt-auto flex w-full flex-shrink-0 flex-col items-center gap-4 md:mt-0 md:max-w-[360px] md:items-stretch">
                 <div className="flex w-full flex-wrap items-center justify-center gap-3 md:justify-start">
                   {!isOnlineBattle ? (
                     <>
