@@ -77,7 +77,7 @@ type OnlineBroadcastState = {
   startingPlayer: Player;
   actionDeadlineMs?: number | null;
   // 勝利確定時の理由（25ゴール演出のディレイ有無などに使う）
-  winReason?: "goal" | "surrender";
+  winReason?: "goal" | "surrender" | "disconnect" | "timeout";
 };
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -814,6 +814,9 @@ export default function Page() {
   const [bgmMuted, setBgmMuted] = useState<boolean>(false);
   const [seMuted, setSeMuted] = useState<boolean>(false);
   const [isIOSSafari, setIsIOSSafari] = useState<boolean>(false);
+  const [onlineSignalLeftSec, setOnlineSignalLeftSec] = useState<number | null>(null);
+  const [roomAbortDialogOpen, setRoomAbortDialogOpen] = useState(false);
+  const [roomAbortReason, setRoomAbortReason] = useState<string>("");
 
   // Active game settings
   const [target, setTarget] = useState<number>(DEFAULT_TARGET);
@@ -882,6 +885,9 @@ export default function Page() {
   const hasPersistedMatchRef = useRef<boolean>(false);
   const playerRateRef = useRef<number>(playerRate);
   const opponentRateRef = useRef<number>(opponentRate);
+  const lastOpponentSignalMsRef = useRef<number>(Date.now());
+  const onlineDisconnectResolvedRef = useRef<boolean>(false);
+  const forcePersistOnlineResultRef = useRef<boolean>(false);
 
   // Audio management
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -926,6 +932,15 @@ export default function Page() {
   useEffect(() => {
     opponentRateRef.current = opponentRate;
   }, [opponentRate]);
+
+  useEffect(() => {
+    // 新しい対戦開始時に通信監視状態を初期化
+    if (screen !== "play") return;
+    if (mode !== "online") return;
+    lastOpponentSignalMsRef.current = Date.now();
+    onlineDisconnectResolvedRef.current = false;
+    forcePersistOnlineResultRef.current = false;
+  }, [mode, screen]);
 
   useEffect(() => {
     onlineBotFallbackRef.current = onlineBotFallback;
@@ -1505,6 +1520,39 @@ export default function Page() {
     setResultRateNonce((n) => n + 1);
   }
 
+  function showRoomAbortDialog(message: string) {
+    setRoomAbortReason(message);
+    setRoomAbortDialogOpen(true);
+  }
+
+  async function handleOnlineDisconnectOrTimeout(reason: "disconnect" | "timeout") {
+    // 通常勝利や既存の切断判定が走っている場合は二重実行しない
+    if (onlineDisconnectResolvedRef.current) return;
+    if (winnerRef.current || pendingWinnerRef.current) return;
+    if (modeRef.current !== "online") return;
+    if (!online) return;
+    onlineDisconnectResolvedRef.current = true;
+    setOnlineSignalLeftSec(null);
+
+    // レートマッチ: 切断/放置した側を敗北として扱い、残った側を勝利にする
+    if (matchTypeRef.current === "random") {
+      forcePersistOnlineResultRef.current = true;
+      const myWin: Player = online.player;
+      win(myWin, 400);
+      return;
+    }
+
+    // ルームマッチ: 中止扱い（レート更新なし）で戻す
+    if (reason === "timeout") {
+      showRoomAbortDialog("相手の応答が60秒間ありませんでした。対戦を中止します。");
+    } else {
+      showRoomAbortDialog("相手が切断しました。対戦を中止します。");
+    }
+    await leaveOnlineRoom();
+    await leaveMatchChannel();
+    await cleanupMatchRecord();
+  }
+
   async function leaveMatchChannel() {
     if (matchChannelRef.current) {
       await supabase.removeChannel(matchChannelRef.current);
@@ -1539,6 +1587,11 @@ export default function Page() {
     setRateLoading(false);
     setPlayerRate(1500);
     setOpponentRate(1500);
+    setOnlineSignalLeftSec(null);
+    setRoomAbortDialogOpen(false);
+    setRoomAbortReason("");
+    forcePersistOnlineResultRef.current = false;
+    onlineDisconnectResolvedRef.current = false;
     setScreen("menu");
   }
 
@@ -1582,6 +1635,11 @@ export default function Page() {
     setOnlineBotFallback(false);
     setCpuFallbackMessage(null);
     setOnlineOpponentName("");
+    setOnlineSignalLeftSec(null);
+    setRoomAbortDialogOpen(false);
+    setRoomAbortReason("");
+    forcePersistOnlineResultRef.current = false;
+    onlineDisconnectResolvedRef.current = false;
     setMenuMode("online");
     setScreen("matching");
     setMatchNotFound(false);
@@ -1819,6 +1877,8 @@ export default function Page() {
     channel.on("broadcast", { event: "state" }, (payload) => {
       const data = payload.payload as unknown as OnlineBroadcastState;
       if (!data || data.clientId === clientId) return;
+      // 相手から状態を受信した時刻を更新（無通信タイムアウト監視用）
+      lastOpponentSignalMsRef.current = Date.now();
 
       // ターン壁：自分のターン開始直後に遅延して届いた opponent 側 broadcast を無視して、
       // movesLeft やタイマーの「残像ゴースト」を防ぐ
@@ -1873,9 +1933,11 @@ export default function Page() {
       const state = channel.presenceState() as Record<string, Array<{ player?: Player; name?: string; userId?: string }>>;
       let opponent = "";
       let opponentUserId = "";
+      let opponentPresent = false;
       for (const entries of Object.values(state)) {
         for (const e of entries ?? []) {
           if (e?.player === otherPlayer) {
+            opponentPresent = true;
             if (typeof e?.name === "string" && e.name.trim()) opponent = e.name.trim();
             if (typeof e?.userId === "string" && e.userId.trim()) opponentUserId = e.userId.trim();
             break;
@@ -1885,8 +1947,22 @@ export default function Page() {
       }
       if (opponent) setOnlineOpponentName(opponent);
       if (opponentUserId) setOnlineOpponentUserId(opponentUserId);
+      if (opponentPresent) {
+        // Presence同期で相手の生存を確認できたので通信時刻を更新
+        lastOpponentSignalMsRef.current = Date.now();
+      } else if (screen === "play" && online?.ready) {
+        // 対戦中に相手が Presence から消えたら離脱扱い
+        void handleOnlineDisconnectOrTimeout("disconnect");
+      }
 
       opts?.onPresenceSync?.(channel);
+    });
+
+    channel.on("presence", { event: "leave" }, () => {
+      // 明示的 leave を検知したら切断勝敗判定へ
+      if (screen === "play") {
+        void handleOnlineDisconnectOrTimeout("disconnect");
+      }
     });
 
     // Set immediately so presence callback can broadcast before `subscribe()` resolves.
@@ -1936,6 +2012,11 @@ export default function Page() {
     setBotDisplayedOpponentRate(1500);
     botDisplayGeneratedRef.current = false;
     setShowGodVictory(false);
+    setOnlineSignalLeftSec(null);
+    setRoomAbortDialogOpen(false);
+    setRoomAbortReason("");
+    forcePersistOnlineResultRef.current = false;
+    onlineDisconnectResolvedRef.current = false;
     setPendingWinner(null);
     if (pendingWinnerTimeoutRef.current) window.clearTimeout(pendingWinnerTimeoutRef.current);
     pendingWinnerTimeoutRef.current = null;
@@ -2084,6 +2165,11 @@ export default function Page() {
     setOnlineOpponentName("");
     setOnlineOpponentUserId("");
     setOnlineBotFallback(false);
+    setOnlineSignalLeftSec(null);
+    setRoomAbortDialogOpen(false);
+    setRoomAbortReason("");
+    forcePersistOnlineResultRef.current = false;
+    onlineDisconnectResolvedRef.current = false;
     setMatchType(null);
     setRateLoading(false);
     hasFetchedMyRateForMatchRef.current = false;
@@ -2359,7 +2445,7 @@ export default function Page() {
       // オンライン対戦では DB の Elo 更新はホストだけが行います。
       // ただし、ゲスト側も「リザルトでレート変動」を表示できるよう、
       // 結果時に DB の現在レートを取り直して差分を作ります（保存/更新はしない）。
-      if (modeNow === "online" && online && online.role !== "host") {
+      if (modeNow === "online" && online && online.role !== "host" && !forcePersistOnlineResultRef.current) {
         const mt = matchTypeRef.current;
         if (mt === "random" && onlineOpponentUserId) {
           const beforeYour = playerRateRef.current;
@@ -2416,8 +2502,10 @@ export default function Page() {
 
       try {
         if (modeNow === "online") {
-          // online はホストだけが DB へ書き込み
-          if (!online || online.role !== "host") return;
+          // online は通常ホストだけが DB へ書き込み。
+          // ただし切断/放置で勝者側がゲストの場合のみ、勝者側で強制保存する。
+          if (!online) return;
+          if (online.role !== "host" && !forcePersistOnlineResultRef.current) return;
 
           const mt = matchTypeRef.current;
           if (mt !== "random" && mt !== "room") return;
@@ -2582,6 +2670,29 @@ export default function Page() {
       }
     })();
   }, [winner, screen, onlineOpponentUserId, online]);
+
+  useEffect(() => {
+    // オンライン対戦中のみ「相手の無通信 60 秒」を監視する
+    if (screen !== "play" || mode !== "online" || !online?.ready) {
+      setOnlineSignalLeftSec(null);
+      return;
+    }
+    if (winner || pendingWinner) {
+      setOnlineSignalLeftSec(null);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      const elapsedSec = Math.floor((Date.now() - lastOpponentSignalMsRef.current) / 1000);
+      const left = Math.max(0, 60 - elapsedSec);
+      setOnlineSignalLeftSec(left);
+      if (left <= 0) {
+        window.clearInterval(timer);
+        void handleOnlineDisconnectOrTimeout("timeout");
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, online, pendingWinner, screen, winner]);
 
   function bumpForChanges(prev: number[], next: number[]) {
     setBumpIds((ids) => ids.map((id, i) => (prev[i] === next[i] ? id : id + 1)));
@@ -3796,6 +3907,12 @@ export default function Page() {
                     </div>
                   )}
 
+                  {mode === "online" && onlineSignalLeftSec !== null && !winner && !pendingWinner && (
+                    <div className="rounded-[999px] border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-black text-amber-800 shadow-[0_12px_0_rgba(255,255,255,.72)_inset,0_14px_20px_rgba(90,60,160,.10)]">
+                      相手の応答を待っています... {onlineSignalLeftSec}s
+                    </div>
+                  )}
+
                   {/* レイアウトシフト防止：表示/非表示でも高さ固定 */}
                   <div className="min-h-[46px] flex items-center">
                     <motion.div
@@ -4299,6 +4416,42 @@ export default function Page() {
                     <div className="text-xs font-bold text-zinc-600">次に降ってくる数字（NEXT）を見ながら戦略を練りましょう。</div>
                   </div>
                 </div>
+              </motion.div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {roomAbortDialogOpen && (
+          <motion.div
+            className="fixed inset-0 z-80"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <div className="absolute inset-0 bg-black/45 backdrop-blur-sm" />
+            <div className="relative mx-auto flex h-full w-full max-w-md items-center justify-center px-4">
+              <motion.div
+                className="w-full rounded-3xl border border-white/70 bg-white/90 p-6 text-center shadow-[0_34px_110px_rgba(120,70,40,.20)]"
+                initial={{ y: 14, scale: 0.97, opacity: 0 }}
+                animate={{ y: 0, scale: 1, opacity: 1 }}
+                exit={{ y: 10, scale: 0.98, opacity: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                <div className="text-xs font-black tracking-[0.25em] text-zinc-500">ONLINE</div>
+                <div className="mt-2 text-xl font-black tracking-tight text-zinc-900">対戦中止</div>
+                <div className="mt-3 text-sm font-semibold text-zinc-700">{roomAbortReason || "対戦を終了しました。"}</div>
+                <button
+                  type="button"
+                  className="mt-5 rounded-[28px] border border-white/70 bg-white/90 px-6 py-3 text-sm font-extrabold text-zinc-800 shadow-[0_16px_0_rgba(255,255,255,.72)_inset,0_18px_30px_rgba(90,60,160,.14)] transition-transform hover:brightness-105 active:scale-[0.98]"
+                  onClick={() => {
+                    setRoomAbortDialogOpen(false);
+                    backToMenu();
+                  }}
+                >
+                  モード選択へ戻る
+                </button>
               </motion.div>
             </div>
           </motion.div>
