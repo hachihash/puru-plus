@@ -30,7 +30,21 @@ function computeToValue(sum: number, target: number) {
   return sum === target ? target : sum > target ? sum % target : sum;
 }
 
-function applyMove(board: number[], from: number, to: number, refillValue: number, target: number): {
+function isWinningSum(sum: number, target: number, includeDoubleTargetWin = false) {
+  if (sum === target) return true;
+  // GOD防御用: target=25 のときは 50 到達も「実質的な勝ち筋」として危険判定に含める
+  if (includeDoubleTargetWin && target === 25 && sum === 50) return true;
+  return false;
+}
+
+function applyMove(
+  board: number[],
+  from: number,
+  to: number,
+  refillValue: number,
+  target: number,
+  includeDoubleTargetWin = false,
+): {
   nextBoard: number[];
   didWin: boolean;
 } {
@@ -38,7 +52,7 @@ function applyMove(board: number[], from: number, to: number, refillValue: numbe
   const next: number[] = [...board];
   next[to] = computeToValue(sum, target);
   next[from] = refillValue;
-  return { nextBoard: next, didWin: sum === target };
+  return { nextBoard: next, didWin: isWinningSum(sum, target, includeDoubleTargetWin) };
 }
 
 function powInt(base: number, exp: number) {
@@ -85,13 +99,13 @@ function findWinAtStep(
   const refill1 = nextQueue[nextIndex + 1] ?? 1;
   const refill2 = nextQueue[nextIndex + 2] ?? 1;
   for (const m0 of LEGAL_MOVES) {
-    const r0 = applyMove(board, m0.from, m0.to, refill0, target);
+    const r0 = applyMove(board, m0.from, m0.to, refill0, target, true);
     if (r0.didWin) continue;
     for (const m1 of LEGAL_MOVES) {
-      const r1 = applyMove(r0.nextBoard, m1.from, m1.to, refill1, target);
+      const r1 = applyMove(r0.nextBoard, m1.from, m1.to, refill1, target, true);
       if (r1.didWin) continue;
       for (const m2 of LEGAL_MOVES) {
-        const r2 = applyMove(r1.nextBoard, m2.from, m2.to, refill2, target);
+        const r2 = applyMove(r1.nextBoard, m2.from, m2.to, refill2, target, true);
         if (r2.didWin) return [m0, m1, m2];
       }
     }
